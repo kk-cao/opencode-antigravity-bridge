@@ -88,8 +88,9 @@ function findAgy() {
   }
   const home = os.homedir()
   candidates.push(
-    path.join(home, ".local", "bin", "agy"),
-    path.join(home, ".gemini", "bin", "agy"),
+    path.join(home, "AppData", "Local", "agy", "bin", "agy.exe"),
+    path.join(home, ".local", "bin", process.platform === "win32" ? "agy.exe" : "agy"),
+    path.join(home, ".gemini", "bin", process.platform === "win32" ? "agy.exe" : "agy"),
     "/usr/local/bin/agy",
     "/opt/homebrew/bin/agy",
   )
@@ -109,6 +110,7 @@ function execOnce(file, args, opts = {}) {
     try {
       child = spawn(file, args, {
         stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true,
         ...opts,
       })
     } catch (err) {
@@ -608,6 +610,7 @@ class Proc {
     try {
       this.child = spawn(this.agyPath, args, {
         cwd: this.workspace,
+        windowsHide: true,
         stdio: ["pipe", "pipe", "pipe"],
         env: {
           ...process.env,
@@ -824,14 +827,19 @@ class Proc {
     try {
       if (model && model !== this.currentModel) await this.#setModel(model)
       // Text a cancelled turn never delivered still belongs to the session.
-      let text = this.unsentPrompt ? this.unsentPrompt + "\n\n" + content : content
-      this.unsentPrompt = ""
+      const toPrompt = (val) => Array.isArray(val) ? val : [{ type: "text", text: String(val ?? "") }]
+      let prompt = toPrompt(content)
+      if (this.unsentPrompt) {
+        const unsent = toPrompt(this.unsentPrompt)
+        prompt = [...unsent, { type: "text", text: "\n\n" }, ...prompt]
+        this.unsentPrompt = ""
+      }
       let usage = null
       for (;;) {
         turn.logOffset = await fileSize(this.logPath)
         // A cancel that arrived before the prompt would be ignored by agy.
         if (turn.cancelRequested) {
-          if (this.hasSentFirstTurn) this.unsentPrompt = text
+          if (this.hasSentFirstTurn) this.unsentPrompt = prompt
           turn.complete({ stopReason: "cancelled" })
           return
         }
@@ -839,7 +847,7 @@ class Proc {
         this.hasSentFirstTurn = true
         const result = await this.conn.request("session/prompt", {
           sessionId: this.sessionId,
-          prompt: [{ type: "text", text }],
+          prompt,
         })
         usage = addUsage(usage, result?.usage)
         if (turn.cancelRequested) {
@@ -860,7 +868,7 @@ class Proc {
         turn.arm()
         await turn.waitLate()
         for (const call of late) call.lateDelivered = true
-        text = renderLateResults(late)
+        prompt = [{ type: "text", text: renderLateResults(late) }]
       }
     } catch (error) {
       if (turn.cancelRequested && !this.dead) {
@@ -1508,12 +1516,27 @@ function normalizeTools(body) {
   return tools
 }
 
+function imageBlock(block) {
+  if (block?.source?.type === "base64" && typeof block.source.data === "string" && block.source.data) {
+    return {
+      type: "image",
+      data: block.source.data,
+      mimeType: block.source.media_type || "image/png",
+    }
+  }
+  throw new UnsupportedContent("an image block without base64 source data")
+}
+
 function blockText(block) {
   if (typeof block === "string") return block
   if (!block || typeof block !== "object" || Array.isArray(block)) {
     throw new UnsupportedContent("a non-object content block")
   }
   if (block.type === "text") return typeof block.text === "string" ? block.text : ""
+  if (block.type === "image") {
+    imageBlock(block)
+    return "[image]"
+  }
   if (block.type === "tool_result") {
     const inner = Array.isArray(block.content)
       ? block.content.map((part) => {
@@ -1523,16 +1546,23 @@ function blockText(block) {
       : String(block.content ?? "")
     return `[tool result${block.tool_use_id ? " id=" + block.tool_use_id : ""}]\n${inner}\n[end of tool result]`
   }
-  if (block.type === "image" || block.type === "document") {
-    throw new UnsupportedContent("an image/document block in a user message (agy's ACP prompt accepts text only)")
+  if (block.type === "document") {
+    throw new UnsupportedContent("a document block in a user message")
   }
   if (block.type === "tool_use") throw new UnsupportedContent("a tool_use block in a user message")
   throw new UnsupportedContent(`a content block of type ${JSON.stringify(block.type)}`)
 }
 
+function messageImages(message) {
+  if (!Array.isArray(message?.content)) return []
+  return message.content.filter(block => block?.type === "image").map(imageBlock)
+}
+
 function messageText(message) {
   if (typeof message.content === "string") return message.content
-  if (Array.isArray(message.content)) return message.content.map(blockText).join("")
+  if (Array.isArray(message.content)) {
+    return message.content.filter(block => block?.type !== "image").map(blockText).join("")
+  }
   return String(message.content ?? "")
 }
 
@@ -1586,14 +1616,18 @@ function renderInitialPrompt(body, callerWorkDir, instructionsInSession) {
   }
   const currentText = current.map(message => message.role === "user"
     ? messageText(message) : `${message.role}: ${messageText(message)}`).join("\n\n")
-  // A fresh conversation needs no wrapper; it would only add tokens.
-  if (!out.length) return currentText
-  out.push("<current_turn>\n", currentText, "\n</current_turn>")
-  return out.join("")
+  const images = [...history, ...current].flatMap(messageImages)
+  const finalText = !out.length ? currentText : [...out, "<current_turn>\n", currentText, "\n</current_turn>"].join("")
+  if (!images.length) return finalText
+  return [...images, ...(finalText ? [{ type: "text", text: finalText }] : [])]
 }
 
 function renderContinuedTurn(body) {
-  return messageText(body.messages[body.messages.length - 1])
+  const last = body.messages[body.messages.length - 1]
+  const images = messageImages(last)
+  const text = messageText(last)
+  if (!images.length) return text
+  return [...images, ...(text ? [{ type: "text", text }] : [])]
 }
 
 function validateBody(body) {
@@ -2178,14 +2212,19 @@ export const AntigravityBridgePlugin = async () => {
         const catalog = agy ? await loadModelCatalog(agy, true) : buildModelCatalog(FALLBACK_MODELS)
         const out = {}
         for (const model of catalog.models) {
+          const supportsVision = !/^gpt-oss/i.test(model.id)
           out[model.id] = {
             id: model.id,
             name: model.name,
             npm: NPM_ANTHROPIC,
             api: { id: model.id, url: "agy://local", npm: NPM_ANTHROPIC },
+            ...(supportsVision ? {
+              attachment: true,
+              modalities: { input: ["text", "image"], output: ["text"] },
+            } : {}),
             ...(model.variants ? {
               reasoning: true,
-              capabilities: { reasoning: true },
+              capabilities: { reasoning: true, ...(supportsVision ? { attachment: true } : {}) },
               variants: Object.fromEntries(model.variants.map(effort => [effort, {}])),
             } : {}),
           }

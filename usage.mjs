@@ -106,8 +106,12 @@ function run(file, args, { cwd, env, deadline, signal, maxOutputBytes }) {
       if (!child?.pid || stopped) return
       stopped = true
       // Only this detached child/group is ours, never an existing user agy.
-      try { process.kill(-child.pid, "SIGKILL") } catch {
-        try { child.kill("SIGKILL") } catch {}
+      if (process.platform === "win32") {
+        try { child.kill() } catch {}
+      } else {
+        try { process.kill(-child.pid, "SIGKILL") } catch {
+          try { child.kill("SIGKILL") } catch {}
+        }
       }
     }
     const finish = (error, result) => {
@@ -125,7 +129,7 @@ function run(file, args, { cwd, env, deadline, signal, maxOutputBytes }) {
     if (signal?.aborted) return abort()
     if (Date.now() >= deadline) return finish(new UsageError("agy usage query timed out."))
     try {
-      child = spawn(file, args, { cwd, env, detached: true, stdio: ["ignore", "pipe", "pipe"] })
+      child = spawn(file, args, { cwd, env, detached: process.platform !== "win32", windowsHide: true, stdio: ["ignore", "pipe", "pipe"] })
     } catch {
       finish(new UsageError("agy usage could not start the CLI."))
       return
@@ -165,8 +169,6 @@ export async function fetchUsage(agy, {
   tempRoot = os.tmpdir(),
 } = {}) {
   if (!agy) throw new UsageError("agy CLI not found. Install it and run `agy` once to sign in.")
-  // Browser launcher blocking and owned process-group cleanup are POSIX-specific.
-  if (process.platform === "win32") throw new UsageError("agy bridge usage queries currently require macOS or Linux.")
   const deadline = Date.now() + timeout(timeoutMs)
   const directory = await fs.mkdtemp(path.join(tempRoot, "magpie-agy-usage-"))
   try {
