@@ -1699,38 +1699,35 @@ function extractToolResults(body) {
     ? message.content.filter(block => block?.type === "tool_result") : [])
 }
 
-// Forward complete protocol-generated context notices without turning ordinary
-// user instructions into tool output. OpenCode can append a <system-update>
-// after a tool result when its dynamic tool catalog changes.
+// Forward any additional text or image blocks alongside tool results so clients
+// that attach environment reminders, hook outputs, or mid-turn user instructions
+// beside a tool_result do not fail with HTTP 400.
 function withContextNotices(results, body) {
-  const notices = []
-  let seenResult = false
-  const contextNotice = /<system-update(?:\s[^>]*)?>[\s\S]*?<\/system-update>|(?:\[SYSTEM NOTIFICATION - NOT USER INPUT\][^<]*)?<task-notification>[\s\S]*?<\/task-notification>/g
+  const extraParts = []
+  const textNotices = []
   for (const message of trailingMessages(body).messages) {
     const blocks = Array.isArray(message.content) ? message.content : [message.content]
     for (const block of blocks) {
-      if (block?.type === "tool_result") {
-        seenResult = true
+      if (block?.type === "tool_result") continue
+      if (block?.type === "image") {
+        extraParts.push(imageBlock(block))
         continue
       }
-      const text = blockText(block)
-      if (!seenResult && text.trim()) {
-        throw new UnsupportedContent("text beside a live tool_result; send it after the tool response completes")
-      }
-      notices.push(...Array.from(text.matchAll(contextNotice), match => match[0]))
-      const rest = text.replace(contextNotice, "").replace(/<\/?system-reminder(?:\s[^>]*)?>/g, "").trim()
-      if (/The user sent (?:a new message while you were working|the following message):/.test(rest) ||
-        (rest && !/^(?:<total_tokens>[^<]*<\/total_tokens>|Token usage: \S+; \S+ remaining)$/.test(rest) &&
-        !/^[A-Z][A-Za-z]+(?::\S+)? hook (?:additional context|success|blocking error(?: from command)?|stopped continuation|feedback):/.test(rest))) {
-        throw new UnsupportedContent("text beside a live tool_result; send it after the tool response completes")
-      }
+      const text = blockText(block).trim()
+      if (text) textNotices.push(text)
     }
   }
-  if (!notices.length) return results
+  if (textNotices.length) {
+    extraParts.push({
+      type: "text",
+      text: `<system-reminder>\n${textNotices.join("\n\n")}\n</system-reminder>`,
+    })
+  }
+  if (!extraParts.length || !results.length) return results
   const last = results.at(-1)
   return [...results.slice(0, -1), { ...last, result: {
     ...last.result,
-    content: [...last.result.content, { type: "text", text: `<system-reminder>\n${notices.join("\n\n")}\n</system-reminder>` }],
+    content: [...last.result.content, ...extraParts],
   } }]
 }
 
