@@ -14,8 +14,9 @@ const MCP_SERVER_PATH = fileURLToPath(new URL("./mcp-server.mjs", import.meta.ur
 // agy exposes tools from the --ide-mcp-port server as direct functions with this prefix.
 const IDE_TOOL_PREFIX = "mcp_ide-tools_"
 const IDLE_MS = positiveTimeout(process.env.AGY_BRIDGE_IDLE_MS, 10 * 60 * 1000)
-const MAX_PROCS = 4
-const MAX_PARKED = 32
+const MAX_IDLE_PROCS = positiveTimeout(process.env.AGY_BRIDGE_MAX_IDLE_PROCS, 4)
+const MAX_PROCS = positiveTimeout(process.env.AGY_BRIDGE_MAX_PROCS, 16)
+const MAX_PARKED = 64
 const DEFAULT_PROC_START_TIMEOUT_MS = 60_000
 const TURN_TIMEOUT_MS = positiveTimeout(process.env.AGY_BRIDGE_TURN_TIMEOUT_MS, 5 * 60 * 1000)
 const TOOL_RESULT_TIMEOUT_MS = positiveTimeout(process.env.AGY_BRIDGE_TOOL_TIMEOUT_MS, 30 * 60 * 1000)
@@ -143,7 +144,9 @@ async function listAgyModels(agyPath) {
 }
 
 const EFFORT_ORDER = ["minimal", "low", "medium", "high", "xhigh", "max"]
+const MODEL_CATALOG_TTL_MS = 60_000
 let cachedModelCatalog
+let pendingModelCatalog
 
 function modelFamilyId(model) {
   if (!model.effort) return ""
@@ -195,10 +198,20 @@ function buildModelCatalog(list) {
 }
 
 async function loadModelCatalog(agyPath, refresh = false) {
-  if (!refresh && cachedModelCatalog?.agyPath === agyPath) return cachedModelCatalog.catalog
-  const catalog = buildModelCatalog(await listAgyModels(agyPath))
-  cachedModelCatalog = { agyPath, catalog }
-  return catalog
+  const now = Date.now()
+  if (cachedModelCatalog?.agyPath === agyPath && (!refresh || now - cachedModelCatalog.at < MODEL_CATALOG_TTL_MS)) {
+    return cachedModelCatalog.catalog
+  }
+  if (pendingModelCatalog?.agyPath === agyPath) return pendingModelCatalog.promise
+  const promise = (async () => {
+    const catalog = buildModelCatalog(await listAgyModels(agyPath))
+    cachedModelCatalog = { agyPath, catalog, at: Date.now() }
+    return catalog
+  })().finally(() => {
+    if (pendingModelCatalog?.promise === promise) pendingModelCatalog = null
+  })
+  pendingModelCatalog = { agyPath, promise }
+  return promise
 }
 
 function normalizeEffort(value) {
@@ -506,6 +519,7 @@ class Turn {
     this.awaitCalls = []
     this.lateWaiters = []
     this.toolSteps = 0
+    this.reportedOutputTokens = 0
     this.attached = false
     this.done = false
     this.finalized = false
@@ -555,7 +569,7 @@ class Turn {
       if (text) this.push({ type: "text", text })
       return
     }
-    for (let keep = Math.min(text.length, AGENT_ERROR_MARKER.length - 1); keep > 0; keep--) {
+    for (let keep = Math.min(text.length, AGENT_ERROR_MARKER.length - 1); keep >= 2; keep--) {
       if (AGENT_ERROR_MARKER.startsWith(text.slice(-keep))) {
         this.heldText = text.slice(-keep)
         text = text.slice(0, -keep)
@@ -660,6 +674,7 @@ class Proc {
     this.unsentPrompt = null
     this.turn = null
     this.expectedMessages = null
+    this.expectedHistoryKey = null
     this.toolsVersion = 1
     this.listedVersion = 0
     this.listWaiters = []
@@ -776,6 +791,7 @@ class Proc {
         this.resumed = true
         this.hasSentFirstTurn = true
         this.expectedMessages = this.resumeFrom.expectedMessages.map((message) => ({ ...message }))
+        this.expectedHistoryKey = null
       } catch {
         session = null
       }
@@ -788,8 +804,10 @@ class Proc {
     // A resumed session reports the account default; always apply the selection.
     this.currentModel = session?.models?.currentModelId ?? null
     this.configOptions = Array.isArray(session?.configOptions) ? session.configOptions : []
-    if (this.model) await this.#setModel(this.model, this.selection, this.resumed)
-    if (this.tools.length) await this.#waitForToolList(this.toolsVersion)
+    await Promise.all([
+      this.model ? this.#setModel(this.model, this.selection, this.resumed) : Promise.resolve(),
+      this.tools.length ? this.#waitForToolList(this.toolsVersion) : Promise.resolve(),
+    ])
   }
 
   async #setConfig(config, value) {
@@ -933,6 +951,7 @@ class Proc {
     const turn = new Turn(this, messages)
     this.turn = turn
     this.expectedMessages = messages.map((message) => ({ ...message }))
+    this.expectedHistoryKey = null
     this.historyInvalid = false
     this.lastUsed = Date.now()
     this.#runTurn(turn, content, model, selection).catch(() => {})
@@ -942,8 +961,9 @@ class Proc {
   matchesHistory(messages) {
     if (this.historyInvalid) return false
     if (this.expectedMessages == null) return !this.turn && !this.hasSentFirstTurn
-    this.#syncClientToolInputs(messages)
-    return historyKey(this.expectedMessages) === historyKey(messages)
+    if (this.#syncClientToolInputs(messages)) this.expectedHistoryKey = null
+    if (this.expectedHistoryKey == null) this.expectedHistoryKey = historyKey(this.expectedMessages)
+    return this.expectedHistoryKey === historyKey(messages)
   }
 
   // Clients such as Alma validate tool_use inputs through Zod schemas that fill
@@ -951,14 +971,15 @@ class Proc {
   // assistant message back with tool_result. Adopt those client-defaulted inputs
   // when every argument agy actually emitted is unchanged.
   #syncClientToolInputs(messages) {
-    if (!Array.isArray(this.expectedMessages) || !Array.isArray(messages)) return
+    if (!Array.isArray(this.expectedMessages) || !Array.isArray(messages)) return false
     const expUses = this.expectedMessages.flatMap((msg) =>
       msg?.role === "assistant" && Array.isArray(msg.content) ? msg.content.filter((b) => b?.type === "tool_use") : [],
     )
     const msgUses = messages.flatMap((msg) =>
       msg?.role === "assistant" && Array.isArray(msg.content) ? msg.content.filter((b) => b?.type === "tool_use") : [],
     )
-    if (expUses.length !== msgUses.length) return
+    if (expUses.length !== msgUses.length) return false
+    let changed = false
     for (let j = 0; j < expUses.length; j++) {
       const a = expUses[j]
       const b = msgUses[j]
@@ -967,9 +988,13 @@ class Proc {
       const bIn = b.input ?? {}
       if (typeof aIn === "object" && typeof bIn === "object" && !Array.isArray(aIn) && !Array.isArray(bIn)) {
         const isSubset = Object.keys(aIn).every((k) => k in bIn && stableJSON(aIn[k]) === stableJSON(bIn[k]))
-        if (isSubset) a.input = bIn
+        if (isSubset && a.input !== bIn) {
+          a.input = bIn
+          changed = true
+        }
       }
     }
+    return changed
   }
 
   // Clients such as Claude Code normalize tool_use inputs when recording an
@@ -1006,12 +1031,16 @@ class Proc {
   }
 
   recordToolResults(turn, messages) {
-    if (this.turn === turn) this.expectedMessages = messages.map((message) => ({ ...message }))
+    if (this.turn === turn) {
+      this.expectedMessages = messages.map((message) => ({ ...message }))
+      this.expectedHistoryKey = null
+    }
   }
 
   recordAssistantResponse(turn, content) {
     if (this.turn === turn && this.expectedMessages) {
       this.expectedMessages.push({ role: "assistant", content })
+      this.expectedHistoryKey = null
     }
   }
 
@@ -1071,6 +1100,7 @@ class Proc {
       if (error instanceof AgentTurnError && !this.dead && !turn.calls.length) {
         // agy kept the session; a retry of the same request continues in it.
         this.expectedMessages = turn.baseHistory
+        this.expectedHistoryKey = null
         turn.fail(error)
         return
       }
@@ -1109,6 +1139,7 @@ class Proc {
     turn.detach()
     if (this.expectedMessages && partialContent.length) {
       this.expectedMessages.push({ role: "assistant", content: partialContent })
+      this.expectedHistoryKey = null
     }
     this.conn.notify("session/cancel", { sessionId: this.sessionId })
     const timer = setTimeout(() => {
@@ -1279,7 +1310,12 @@ class Proc {
       if (call.id && toolCalls.get(call.id)?.call === call) toolCalls.delete(call.id)
       if (call.mcpSeen && !call.mcpResponded) {
         this.historyInvalid = true
-        this.#respondMcp(call, { error: { code: -32603, message: "agy bridge: response closed before the tool result arrived" } })
+        if (this.stopping) {
+          call.mcpResponded = true
+          call.socket?.destroy()
+        } else {
+          this.#respondMcp(call, { error: { code: -32603, message: "agy bridge: response closed before the tool result arrived" } })
+        }
       }
     }
     if (this.turn === turn) {
@@ -1323,27 +1359,16 @@ class Proc {
 
   async #stop() {
     this.stopping = true
-    this.turn?.fail(new Error("stopped"))
-    this.#markDead(new Error("stopped"))
     sessions.delete(this.token)
-    if (this.turn) {
-      for (const call of this.turn.calls) {
-        if (call.mcpSeen && !call.mcpResponded) {
-          this.#respondMcp(call, { error: { code: -32603, message: "agy bridge: process stopped" } })
-        }
-      }
-    }
-    for (const socket of this.watchers) socket.destroy()
-    this.watchers.clear()
     const child = this.child
     if (child) {
-      try { child.stdin?.end() } catch {}
       const alive = () => child.exitCode === null && child.signalCode === null
       if (alive()) {
         const closed = once(child, "close").catch(() => {})
         if (process.platform === "win32" && child.pid) {
           await execOnce("taskkill", ["/T", "/F", "/PID", String(child.pid)], { timeoutMs: 3_000 })
         } else {
+          try { child.stdin?.end() } catch {}
           try { child.kill("SIGTERM") } catch {}
           await Promise.race([closed, new Promise((resolve) => setTimeout(resolve, 3_000))])
         }
@@ -1354,6 +1379,18 @@ class Proc {
       }
     }
     this.child = null
+    this.turn?.fail(new Error("stopped"))
+    this.#markDead(new Error("stopped"))
+    if (this.turn) {
+      for (const call of this.turn.calls) {
+        if (call.mcpSeen && !call.mcpResponded) {
+          call.mcpResponded = true
+          call.socket?.destroy()
+        }
+      }
+    }
+    for (const socket of this.watchers) socket.destroy()
+    this.watchers.clear()
     if (this.workspace) {
       for (let attempt = 0; attempt < 4; attempt++) {
         try {
@@ -1479,6 +1516,28 @@ function digest(value) {
   return createHash("sha256").update(value).digest("hex")
 }
 
+const IMAGE_DIGEST_CACHE_MAX = 128
+const imageDigestCache = new Map()
+
+function imageDigest(data) {
+  const str = String(data)
+  const key = str.length <= 256
+    ? str
+    : `${str.length}:${str.slice(0, 64)}:${str.slice(str.length >> 1, (str.length >> 1) + 64)}:${str.slice(-64)}`
+  const cached = imageDigestCache.get(key)
+  if (cached !== undefined) {
+    imageDigestCache.delete(key)
+    imageDigestCache.set(key, cached)
+    return cached
+  }
+  const value = digest(str)
+  if (imageDigestCache.size >= IMAGE_DIGEST_CACHE_MAX) {
+    imageDigestCache.delete(imageDigestCache.keys().next().value)
+  }
+  imageDigestCache.set(key, value)
+  return value
+}
+
 // Resumable sessions survive a plugin or Magpie restart: agy keeps the
 // conversation on disk, and this file maps a conversation to its agy session.
 // It stores only hashes of the history and instructions, never message text.
@@ -1490,12 +1549,30 @@ function sessionStateFile() {
 
 let parkedLoaded = false
 const unparked = new Set()
+let cachedStateFile = null
+let cachedStateMtimeMs = -1
+let cachedStateSize = -1
+let cachedStateEntries = []
 
-function readStateFile() {
+function readStateFile(force = false) {
+  const file = sessionStateFile()
   try {
-    const data = JSON.parse(fs.readFileSync(sessionStateFile(), "utf8"))
-    return data?.version === 1 && Array.isArray(data.entries) ? data.entries : []
+    const stat = fs.statSync(file)
+    if (!force && file === cachedStateFile && stat.mtimeMs === cachedStateMtimeMs && stat.size === cachedStateSize) {
+      return cachedStateEntries
+    }
+    const data = JSON.parse(fs.readFileSync(file, "utf8"))
+    const entries = data?.version === 1 && Array.isArray(data.entries) ? data.entries : []
+    cachedStateFile = file
+    cachedStateMtimeMs = stat.mtimeMs
+    cachedStateSize = stat.size
+    cachedStateEntries = entries
+    return entries
   } catch {
+    cachedStateFile = file
+    cachedStateMtimeMs = -1
+    cachedStateSize = -1
+    cachedStateEntries = []
     return []
   }
 }
@@ -1558,7 +1635,7 @@ function saveParked() {
   try {
     withStateLock(file, () => {
       const merged = new Map()
-      for (const entry of readStateFile().filter(validEntry)) merged.set(entry.key, entry)
+      for (const entry of readStateFile(true).filter(validEntry)) merged.set(entry.key, entry)
       for (const key of unparked) merged.delete(key)
       for (const [key, entry] of parked) {
         if ((merged.get(key)?.at ?? 0) <= entry.at) merged.set(key, entry)
@@ -1567,6 +1644,15 @@ function saveParked() {
       const temp = `${file}.${process.pid}.${randomUUID().slice(0, 8)}.tmp`
       fs.writeFileSync(temp, JSON.stringify({ version: 1, entries }) + "\n", { mode: 0o600 })
       fs.renameSync(temp, file)
+      try {
+        const stat = fs.statSync(file)
+        cachedStateFile = file
+        cachedStateMtimeMs = stat.mtimeMs
+        cachedStateSize = stat.size
+        cachedStateEntries = entries
+      } catch {
+        cachedStateMtimeMs = -1
+      }
       unparked.clear()
     })
   } catch {}
@@ -1587,10 +1673,11 @@ function park(proc) {
   loadParked()
   parked.delete(proc.convKey)
   unparked.delete(proc.convKey)
+  if (proc.expectedHistoryKey == null) proc.expectedHistoryKey = historyKey(proc.expectedMessages)
   parked.set(proc.convKey, {
     key: proc.convKey,
     sessionId: proc.sessionId,
-    historyHash: digest(historyKey(proc.expectedMessages)),
+    historyHash: digest(proc.expectedHistoryKey),
     instructionsHash: digest(instructionsKey(proc.instructions)),
     workDir: proc.workDir,
     at: Date.now(),
@@ -1665,45 +1752,55 @@ async function acquireProc(agyPath, convKey, opts, isFreshConversation, forceNew
     if (existing?.turn?.cancelRequested) {
       await Promise.race([existing.turn.settled, new Promise((resolve) => setTimeout(resolve, CANCEL_SETTLE_MS))])
     }
+    let targetKey = convKey
     if (existing) {
       if (!existing.dead && existing.turn) {
-        throw new BusyError("agy bridge: this conversation still has an unfinished response")
-      }
-      let matchedHistory = opts.history
-      if (!forceNew && !existing.dead && !existing.retiring && existing.unsentPrompt &&
-        Array.isArray(opts.messages) && Array.isArray(existing.expectedMessages)) {
-        const k = existing.expectedMessages.length
-        if (k > matchedHistory.length && k <= opts.messages.length &&
-          existing.matchesHistory(opts.messages.slice(0, k))) {
-          matchedHistory = opts.messages.slice(0, k)
+        const sameInFlightRequest = Array.isArray(opts.messages) && Array.isArray(existing.expectedMessages) &&
+          historyKey(opts.messages) === (existing.expectedHistoryKey ?? (existing.expectedHistoryKey = historyKey(existing.expectedMessages)))
+        if (isFreshConversation && !forceNew && (!sameInFlightRequest || (existing.turn.hasPendingMcp() && !existing.turn.attached))) {
+          targetKey = `${convKey}:sub:${randomUUID()}`
+        } else {
+          throw new BusyError("agy bridge: this conversation still has an unfinished response")
         }
+      } else {
+        let matchedHistory = opts.history
+        if (!forceNew && !existing.dead && !existing.retiring && existing.unsentPrompt &&
+          Array.isArray(opts.messages) && Array.isArray(existing.expectedMessages)) {
+          const k = existing.expectedMessages.length
+          if (k > matchedHistory.length && k <= opts.messages.length &&
+            existing.matchesHistory(opts.messages.slice(0, k))) {
+            matchedHistory = opts.messages.slice(0, k)
+          }
+        }
+        const compatible = !forceNew && !existing.dead && !existing.retiring &&
+          existing.workDir === opts.workDir &&
+          instructionsKey(existing.instructions) === instructionsKey(opts.instructions) &&
+          existing.matchesHistory(matchedHistory)
+        if (compatible && !(isFreshConversation && existing.hasSentFirstTurn)) {
+          await existing.updateTools(opts.tools)
+          return { proc: existing, history: matchedHistory }
+        }
+        existing.retiring = true
+        dropFromPool(existing)
+        await existing.stop().catch(() => {})
       }
-      const compatible = !forceNew && !existing.dead && !existing.retiring &&
-        existing.workDir === opts.workDir &&
-        instructionsKey(existing.instructions) === instructionsKey(opts.instructions) &&
-        existing.matchesHistory(matchedHistory)
-      if (compatible && !(isFreshConversation && existing.hasSentFirstTurn)) {
-        await existing.updateTools(opts.tools)
-        return { proc: existing, history: matchedHistory }
-      }
-      existing.retiring = true
-      dropFromPool(existing)
-      await existing.stop().catch(() => {})
     }
-    while (allProcs.size >= MAX_PROCS) {
-      if (!(await evictLRU())) {
+    while (allProcs.size >= MAX_IDLE_PROCS) {
+      if (await evictLRU()) continue
+      if (allProcs.size >= MAX_PROCS) {
         throw new BusyError(`agy bridge: ${MAX_PROCS} agy processes are running and all have unfinished responses`)
       }
+      break
     }
-    const resume = forceNew || isFreshConversation ? null : takeParked(convKey, opts)
-    const proc = new Proc(agyPath, convKey, { ...opts, resume })
+    const resume = forceNew || isFreshConversation ? null : takeParked(targetKey, opts)
+    const proc = new Proc(agyPath, targetKey, { ...opts, resume })
     try {
       await proc.start()
     } catch (error) {
       await proc.stop().catch(() => {})
       throw error
     }
-    pool.set(convKey, proc)
+    pool.set(targetKey, proc)
     return { proc, history: opts.history }
   })
 }
@@ -1813,7 +1910,7 @@ function historyKey(messages) {
         value = { type: "text", text: parseSearchResultText(block) }
       } else if (block.type === "image") {
         const image = parseUserImage(block)
-        value = { type: "image", mimeType: image.mimeType, sha256: digest(image.data) }
+        value = { type: "image", mimeType: image.mimeType, sha256: imageDigest(image.data) }
       } else if (block.type === "tool_use") {
         const ordinal = ids.size + 1
         ids.set(block.id, ordinal)
@@ -1896,7 +1993,7 @@ function conversationKey(body) {
   const system = historyKey([{ role: "system", content: body.system || "" }])
   const first = body.messages?.[0]
   const firstText = first ? historyKey([first]) : ""
-  const discriminator = body.metadata?.user_id || ""
+  const discriminator = body.metadata?.user_id || body.metadata?.session_id || body.user || body.prompt_cache_key || ""
   const source = discriminator + "\n" + system + "\n===\n" + firstText
   return createHash("sha256").update(source).digest("hex")
 }
@@ -2016,10 +2113,23 @@ function sanitizeInputSchema(schema) {
   return out
 }
 
+const TOOLS_CACHE_MAX = 32
+const normalizedToolsCache = new Map()
+
 function normalizeTools(body) {
   if (!Array.isArray(body.tools) || !body.tools.length) return []
   const choice = body.tool_choice
   if (choice === "none" || choice?.type === "none") return []
+  let cacheKey = null
+  try {
+    cacheKey = JSON.stringify({ tools: body.tools, choice: choice ?? null })
+    const cached = normalizedToolsCache.get(cacheKey)
+    if (cached) {
+      normalizedToolsCache.delete(cacheKey)
+      normalizedToolsCache.set(cacheKey, cached)
+      return cached
+    }
+  } catch {}
   const selected = choice?.type === "tool" ? choice.name : null
   const seen = new Set()
   const tools = []
@@ -2042,6 +2152,12 @@ function normalizeTools(body) {
     })
   }
   if (selected && !tools.length) throw new UnsupportedContent(`tool_choice names undeclared tool ${selected}`)
+  if (cacheKey !== null) {
+    if (normalizedToolsCache.size >= TOOLS_CACHE_MAX) {
+      normalizedToolsCache.delete(normalizedToolsCache.keys().next().value)
+    }
+    normalizedToolsCache.set(cacheKey, tools)
+  }
   return tools
 }
 
@@ -2626,6 +2742,7 @@ function inspectToolTurn(results, body) {
   let userSteered = false
   const notices = []
   let seenResult = false
+  let seenCodexContext = false
   let resultIndex = -1
   const stoppedByHookOrUser = out.some((item) => item.result?.isError &&
     /^(?:The user doesn't want to proceed with this tool use\.|User rejected tool use\b|Operation stopped by hook\b|Execution stopped by hook\b|Blocked by PreToolUse hook\b|Hook PreToolUse:\S+ denied\b|API Error: Request was aborted\.|\[Request interrupted by user\b)/.test(resultText(item.result).trim()))
@@ -2663,7 +2780,10 @@ function inspectToolTurn(results, body) {
         if (preRest) {
           throw new UnsupportedContent("text beside a live tool_result; send it after the tool response completes")
         }
-        if (preCodex.length) notices.push(...preCodex)
+        if (preCodex.length) {
+          seenCodexContext = true
+          notices.push(...preCodex)
+        }
         continue
       }
       const text = stripMagpiePlaceholderNotice(rawText)
@@ -2713,8 +2833,10 @@ function inspectToolTurn(results, body) {
         }
       }
       const hasStrictNotice = /<(?:system-update|task-notification)\b/.test(text)
+      const matchedCodex = Array.from(text.matchAll(CODEX_CONTEXT_RE), (match) => match[0])
+      if (matchedCodex.length) seenCodexContext = true
       notices.push(...Array.from(text.matchAll(CONTEXT_NOTICE_RE), (match) => match[0]))
-      notices.push(...Array.from(text.matchAll(CODEX_CONTEXT_RE), (match) => match[0]))
+      notices.push(...matchedCodex)
       const withoutNotices = text.replace(CONTEXT_NOTICE_RE, "").replace(CODEX_CONTEXT_RE, "")
       const matchedReminders = Array.from(withoutNotices.matchAll(SYSTEM_REMINDER_RE))
       for (const match of matchedReminders) {
@@ -2738,13 +2860,14 @@ function inspectToolTurn(results, body) {
       } else if (!isNoise(rest)) {
         if ((hookOutput.test(rest) || claudeMetaFeedback.test(rest)) && !userInterruption.test(rest)) {
           notices.push(rest)
-        } else if (userSteered || stoppedByHookOrUser || skillIndex >= 0 ||
-          notices.some((item) => hookStoppedContinuation.test(item))) {
-          userSteered = true
-        } else if (!hasStrictNotice && !matchedReminders.length && !hookOutput.test(rest)) {
+        } else if (seenCodexContext && !userInterruption.test(rest) && !hasStrictNotice && !matchedReminders.length && !hookOutput.test(rest) && skillIndex < 0) {
           notices.push(
             `The user sent a new message while you were working:\n${rest}\n\nIMPORTANT: Address the user's message above and continue with your tasks.`,
           )
+        } else if ((userSteered || stoppedByHookOrUser || skillIndex >= 0 ||
+          notices.some((item) => hookStoppedContinuation.test(item))) &&
+          !hasStrictNotice && !matchedReminders.length && !hookOutput.test(rest)) {
+          userSteered = true
         } else {
           throw new UnsupportedContent("text beside a live tool_result; send it after the tool response completes")
         }
@@ -2775,34 +2898,13 @@ function canReplayFollowUpAfterResults(body, rawResults) {
       lastResultIndex = i
     }
   }
-  if (lastResultIndex < 0) return false
-  const resultMsg = messages[lastResultIndex]
-  const blocks = Array.isArray(resultMsg.content) ? resultMsg.content : []
-  let lastToolBlockIdx = -1
-  for (let j = 0; j < blocks.length; j++) {
-    if (blocks[j]?.type === "tool_result") lastToolBlockIdx = j
-  }
-  const trailingBlocksInResultMsg = lastToolBlockIdx >= 0 ? blocks.slice(lastToolBlockIdx + 1) : []
-  const hasMergedFollowUp = trailingBlocksInResultMsg.some((block) =>
-    block?.type === "text" && typeof block.text === "string" && block.text.trim() &&
-    !PROTOCOL_NOTICE_START_RE.test(block.text.trim()) && !UNCLOSED_NOTICE_RE.test(block.text.trim()) &&
-    !/^(?:\s*(?:Base directory for this skill:|ARGUMENTS:|Skill arguments:) |Tools? loaded\.|\[Image(?: source)?: )/.test(block.text.trim()))
+  if (lastResultIndex < 0 || lastResultIndex >= messages.length - 1) return false
   const tail = messages.slice(lastResultIndex + 1)
-  if (!hasMergedFollowUp && !tail.some((message) => message.role === "user")) return false
+  if (!tail.some((message) => message.role === "user")) return false
   try {
-    const trimmedResultMsg = hasMergedFollowUp
-      ? { ...resultMsg, content: blocks.slice(0, lastToolBlockIdx + 1) }
-      : resultMsg
-    withContextNotices(rawResults, {
-      ...body,
-      messages: [...history, ...messages.slice(0, lastResultIndex), trimmedResultMsg],
-    })
+    withContextNotices(rawResults, { ...body, messages: [...history, ...messages.slice(0, lastResultIndex + 1)] })
   } catch {
     return false
-  }
-  for (const block of trailingBlocksInResultMsg) {
-    const rest = blockText(block).replace(CONTEXT_NOTICE_RE, "").replace(CODEX_CONTEXT_RE, "").replace(SYSTEM_REMINDER_RE, "")
-    if (UNCLOSED_NOTICE_RE.test(rest)) return false
   }
   for (const message of tail) {
     const rest = messageText(message).replace(CONTEXT_NOTICE_RE, "").replace(CODEX_CONTEXT_RE, "").replace(SYSTEM_REMINDER_RE, "")
@@ -2929,17 +3031,29 @@ const STOP_REASONS = { end_turn: "end_turn", max_tokens: "max_tokens", max_turn_
 // input/cache tokens across every internal LLM request in that session/prompt;
 // divide by the number of steps in the turn so the reported input usage
 // reflects the per-step context window size.
-function translateUsage(usage, steps = 1) {
+function translateUsage(usage, steps = 1, reportedOutputTokens = 0) {
   if (!usage || typeof usage !== "object") return null
   const number = (value) => Number.isFinite(Number(value)) ? Math.max(0, Number(value)) : 0
   const divisor = Number.isFinite(steps) && steps > 1 ? steps : 1
-  const input = Math.round(number(usage.inputTokens) / divisor)
-  const cacheRead = Math.round(number(usage.cachedReadTokens) / divisor)
-  const cacheWrite = Math.round(number(usage.cachedWriteTokens) / divisor)
-  const thinking = number(usage.thoughtTokens)
+  const rawInput = number(usage.inputTokens)
+  const rawCacheRead = number(usage.cachedReadTokens)
+  const rawCacheWrite = number(usage.cachedWriteTokens)
+  const rawOutput = number(usage.outputTokens)
+  const rawThinking = number(usage.thoughtTokens)
+  const rawTotal = number(usage.totalTokens)
+  const inputIncludesCache = rawCacheRead > 0 && rawInput >= rawCacheRead &&
+    rawTotal > 0 && Math.abs((rawInput + rawOutput + rawThinking) - rawTotal) <= 2
+  const uncachedInput = inputIncludesCache ? rawInput - rawCacheRead : rawInput
+  const input = Math.round(uncachedInput / divisor)
+  const cacheRead = Math.round(rawCacheRead / divisor)
+  const cacheWrite = Math.round(rawCacheWrite / divisor)
+  const thinking = divisor > 1 ? Math.round(rawThinking / divisor) : rawThinking
+  const output = divisor > 1
+    ? Math.max(1, rawOutput - Math.max(0, number(reportedOutputTokens)))
+    : rawOutput
   return {
     input_tokens: input,
-    output_tokens: number(usage.outputTokens) + thinking,
+    output_tokens: output + thinking,
     cache_read_input_tokens: cacheRead,
     cache_creation_input_tokens: cacheWrite,
     ...(thinking > 0 ? { output_tokens_details: { thinking_tokens: thinking } } : {}),
@@ -3095,7 +3209,14 @@ function makeAnthropicStream(proc, turn, body, msgId, signal) {
             emitToolUse(event.call)
             // Calls agy issued together leave in the same response.
             while (turn.events[0]?.type === "tool") emitToolUse(turn.events.shift().call)
-            stopMessage("tool_use", emptyUsage)
+            const stepText = responseContent.map((block) =>
+              block.type === "text" ? block.text
+                : block.type === "thinking" ? block.thinking
+                  : block.type === "tool_use" ? `${block.name} ${JSON.stringify(block.input ?? {})}` : "",
+            ).join("\n")
+            const stepOutputTokens = Math.max(1, estimateTextTokens(stepText))
+            turn.reportedOutputTokens = (turn.reportedOutputTokens || 0) + stepOutputTokens
+            stopMessage("tool_use", { input_tokens: 0, output_tokens: stepOutputTokens, cache_read_input_tokens: 0 })
             proc.recordAssistantResponse(turn, responseContent)
             detach()
             controller.close()
@@ -3103,7 +3224,7 @@ function makeAnthropicStream(proc, turn, body, msgId, signal) {
           }
           if (event.type === "result") {
             const steps = (turn.toolSteps || 0) + 1
-            const usage = translateUsage(event.result.usage, steps) || emptyUsage
+            const usage = translateUsage(event.result.usage, steps, turn.reportedOutputTokens || 0) || emptyUsage
             closeBlock()
             stopMessage(STOP_REASONS[event.result.stopReason] || "end_turn", usage)
             proc.recordAssistantResponse(turn, responseContent)
@@ -3437,8 +3558,9 @@ export const AntigravityBridgePlugin = async () => {
                     // session. Replay the real results without resolving the old
                     // process's calls.
                     dropFromPool(proc)
-                    proc.abandonTurn(turn)
+                    proc.stopping = true
                     await proc.stop()
+                    proc.abandonTurn(turn)
                   } else {
                     if (!proc.dead && !turn.done) {
                       // A changed tool catalog applies to the rest of this turn;

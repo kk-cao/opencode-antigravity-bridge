@@ -12,8 +12,8 @@ const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "agy-compat-test-"))
 const entry = new URL("./index.mjs", import.meta.url)
 let source = fs.readFileSync(entry, "utf8")
 source = source.replace(/from "(\.\/[^"\n]+)"/g, (_, target) => `from ${JSON.stringify(new URL(target, entry).href)}`)
-fs.writeFileSync(path.join(workspace, "bridge.mjs"), source + "\nexport { inspectToolTurn, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, withStateLock };\n")
-const { inspectToolTurn, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, withStateLock } = await import(pathToFileURL(path.join(workspace, "bridge.mjs")).href)
+fs.writeFileSync(path.join(workspace, "bridge.mjs"), source + "\nexport { inspectToolTurn, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, withStateLock, Turn, translateUsage, conversationKey };\n")
+const { inspectToolTurn, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, withStateLock, Turn, translateUsage, conversationKey } = await import(pathToFileURL(path.join(workspace, "bridge.mjs")).href)
 after(() => fs.rmSync(workspace, { recursive: true, force: true }))
 
 const image = { type: "image", source: { type: "base64", media_type: "image/png", data: "aW1hZ2VB" } }
@@ -102,4 +102,66 @@ test("state lock recovers a stale lock only after its owning process has exited"
   withStateLock(file, () => { wrote = true })
   assert.equal(wrote, true)
   assert.equal(fs.existsSync(file + ".lock"), false)
+})
+
+test("Turn.pushText emits regular trailing newline immediately and withholds error marker", () => {
+  const proc = {}
+  const turn1 = new Turn(proc, [{ role: "user", content: "hi" }])
+  turn1.pushText("line 1\n")
+  assert.equal(turn1.heldText, "")
+  assert.deepEqual(turn1.events, [{ type: "text", text: "line 1\n" }])
+
+  const turn2 = new Turn(proc, [{ role: "user", content: "hi" }])
+  turn2.pushText("hello\n⚠ Agent ")
+  assert.equal(turn2.heldText, "\n⚠ Agent ")
+  assert.deepEqual(turn2.events, [{ type: "text", text: "hello" }])
+  assert.equal(turn2.agentError, false)
+
+  turn2.pushText("execution terminated due to error.\n")
+  assert.equal(turn2.agentError, true)
+  assert.equal(turn2.heldText, "")
+})
+
+test("translateUsage deducts cached tokens when included in inputTokens, and shares multi-step tokens", () => {
+  const usageWithCache = {
+    inputTokens: 1000,
+    cachedReadTokens: 400,
+    cachedWriteTokens: 0,
+    outputTokens: 100,
+    thoughtTokens: 50,
+    totalTokens: 1150,
+  }
+  const singleStep = translateUsage(usageWithCache, 1, 0)
+  assert.equal(singleStep.input_tokens, 600)
+  assert.equal(singleStep.cache_read_input_tokens, 400)
+  assert.equal(singleStep.output_tokens, 150)
+  assert.deepEqual(singleStep.output_tokens_details, { thinking_tokens: 50 })
+
+  const multiStepUsage = {
+    inputTokens: 600,
+    cachedReadTokens: 0,
+    cachedWriteTokens: 0,
+    outputTokens: 200,
+    thoughtTokens: 60,
+    totalTokens: 860,
+  }
+  const multiStep = translateUsage(multiStepUsage, 2, 80)
+  assert.equal(multiStep.input_tokens, 300)
+  assert.equal(multiStep.output_tokens, 150)
+  assert.deepEqual(multiStep.output_tokens_details, { thinking_tokens: 30 })
+})
+
+test("conversationKey discriminates conversations using session_id, user, and prompt_cache_key", () => {
+  const base = {
+    system: "You are a test assistant.",
+    messages: [{ role: "user", content: "Hello" }],
+  }
+  const keyBase = conversationKey(base)
+  const keyUserId = conversationKey({ ...base, metadata: { user_id: "u1" } })
+  const keySessionId = conversationKey({ ...base, metadata: { session_id: "sess_123" } })
+  const keyUser = conversationKey({ ...base, user: "user_abc" })
+  const keyPromptCacheKey = conversationKey({ ...base, prompt_cache_key: "cache_xyz" })
+
+  const keys = [keyBase, keyUserId, keySessionId, keyUser, keyPromptCacheKey]
+  assert.equal(new Set(keys).size, keys.length, "each discriminator should produce a unique conversationKey")
 })

@@ -1,7 +1,7 @@
-import { spawn } from "node:child_process"
 import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
+import { spawnAgy } from "./platform.mjs"
 
 const DEFAULT_TIMEOUT_MS = 15_000
 const MAX_TIMEOUT_MS = 18_000 // Magpie bounds an auth.usage call to 20 seconds.
@@ -129,7 +129,7 @@ function run(file, args, { cwd, env, deadline, signal, maxOutputBytes }) {
     if (signal?.aborted) return abort()
     if (Date.now() >= deadline) return finish(new UsageError("agy usage query timed out."))
     try {
-      child = spawn(file, args, { cwd, env, detached: process.platform !== "win32", windowsHide: true, stdio: ["ignore", "pipe", "pipe"] })
+      child = spawnAgy(file, args, { cwd, env, detached: process.platform !== "win32", windowsHide: true, stdio: ["ignore", "pipe", "pipe"] })
     } catch {
       finish(new UsageError("agy usage could not start the CLI."))
       return

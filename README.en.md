@@ -18,7 +18,7 @@ restrictions or changes to Google's policies.
 Client (OpenCode, Amp, Claude Code, ...)
   │  Anthropic Messages (POST /v1/messages, SSE)
   ▼
-magpie gateway ── antigravity-bridge provider (this plugin)
+magpie gateway ── agy-acp provider (this plugin)
   │  ACP JSON-RPC on stdio: initialize · session/new|resume · set_model ·
   │  session/prompt · session/update (message + thought chunks) · cancel
   ▼
@@ -236,8 +236,8 @@ Open Magpie's **Usage / Allowances** page and refresh the Antigravity Bridge
 card, or query it from the terminal:
 
 ```sh
-magpie quota antigravity-bridge --json
-magpie quota refresh antigravity-bridge --json
+magpie quota agy-acp --json
+magpie quota refresh agy-acp --json
 ```
 
 Magpie must be running this updated checkout (an older installed copy does not
@@ -455,7 +455,7 @@ On 2026-10-26, the continuation changes were also verified with real agy 1.3.5
 and Magpie 0.1.1564. An isolated local gateway served the plugin directly, and
 an actual OpenCode 2.1.2 session completed `shell (exit 18) → system-update →
 tool_result → second shell call → end_turn`. Local usage records confirmed that
-`antigravity-bridge`, not `remote-magpie`, served every request.
+`agy-acp`, not `remote-magpie`, served every request.
 
 Repeated real-agy probes also exposed intermittent pre-init eligibility failures
 (such as an `oauth2/v2/userinfo` EOF). These are upstream startup failures, not

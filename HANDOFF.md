@@ -140,8 +140,8 @@ Magpie `5b4dec58` 的 host usage hook 及官方 Antigravity pools。设计和实
 包括 Gemini 4 Argon 独立周额度。该 host 验证使用临时 sentinel auth，未复制
 Google 凭据、未改现有 Magpie/agy 配置。未做 GUI 截图或 Linux 真实验证。
 
-查询：`magpie quota antigravity-bridge --json` 或
-`magpie quota refresh antigravity-bridge --json`（需安装的是更新后的代码）。
+查询：`magpie quota agy-acp --json` 或
+`magpie quota refresh agy-acp --json`（需安装的是更新后的代码）。
 截至本记录未推送、发布或替换用户当前安装。
 
 ## 2026-10-26：真实 OpenCode system-update 修复与本地验证
@@ -155,7 +155,7 @@ result 前 update 仍返回 400。
 Node/Bun 各 123 项 smoke checks 通过。真实 agy 1.3.5 + Magpie 0.1.1564 +
 OpenCode 2.1.2 的隔离本地链路已完成两次 shell 调用：第一次实际 exit 18，
 system-update 后续接，第二次成功，最终 end_turn，OpenCode exit 0。usage 明确
-为 antigravity-bridge 本地 provider，不是 remote-magpie。
+为 agy-acp 本地 provider，不是 remote-magpie。
 
 主配置 `noAccountDiscovery: true` 会同时过滤插件账号，导致本地 provider 不在
 catalog，完整模型 ID 随后被 remote-magpie 的嵌套 bare model 匹配。验证使用独立

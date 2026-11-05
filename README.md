@@ -74,7 +74,7 @@ agent。
 客户端 (OpenCode / Amp / Claude Code ...)
   │  Anthropic Messages (POST /v1/messages, SSE)
   ▼
-magpie 网关 ── antigravity-bridge provider（本插件）
+magpie 网关 ── agy-acp provider（本插件）
   │  ACP JSON-RPC over stdio
   ▼
 agy acp          ← 真实的 Antigravity CLI 进程
@@ -94,8 +94,8 @@ Google Code Assist 后端
 **查看订阅额度**：
 
 ```sh
-magpie quota antigravity-bridge --json
-magpie quota refresh antigravity-bridge --json
+magpie quota agy-acp --json
+magpie quota refresh agy-acp --json
 ```
 
 需要当前版本的 magpie（插件 usage 钩子，实测宿主 0.1.1599）。额度窗口仅作
