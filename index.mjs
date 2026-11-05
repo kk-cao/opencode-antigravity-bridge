@@ -10,10 +10,11 @@ import { createUsageReader } from "./usage.mjs"
 
 const PROVIDER_ID = "agy-acp"
 const AGENT_NAME = "magpie-bridge"
+const SESSION_HEADER = "x-magpie-agy-session"
 const MCP_SERVER_PATH = fileURLToPath(new URL("./mcp-server.mjs", import.meta.url))
 // agy exposes tools from the --ide-mcp-port server as direct functions with this prefix.
 const IDE_TOOL_PREFIX = "mcp_ide-tools_"
-const IDLE_MS = positiveTimeout(process.env.AGY_BRIDGE_IDLE_MS, 10 * 60 * 1000)
+const IDLE_MS = positiveTimeout(process.env.AGY_BRIDGE_IDLE_MS, 30 * 60 * 1000)
 const MAX_IDLE_PROCS = positiveTimeout(process.env.AGY_BRIDGE_MAX_IDLE_PROCS, 4)
 const MAX_PROCS = positiveTimeout(process.env.AGY_BRIDGE_MAX_PROCS, 16)
 const MAX_PARKED = 64
@@ -144,9 +145,24 @@ async function listAgyModels(agyPath) {
 }
 
 const EFFORT_ORDER = ["minimal", "low", "medium", "high", "xhigh", "max"]
-const MODEL_CATALOG_TTL_MS = 60_000
+const MODEL_CATALOG_TTL_MS = 30 * 60 * 1000
 let cachedModelCatalog
 let pendingModelCatalog
+
+function populateCatalogFromSessionModels(agyPath, availableModels) {
+  if (!agyPath || !Array.isArray(availableModels) || !availableModels.length) return
+  const out = []
+  for (const item of availableModels) {
+    const id = typeof item?.modelId === "string" ? item.modelId.trim() : ""
+    const name = typeof item?.name === "string" ? item.name.trim() : id
+    if (!id) continue
+    const effort = /-(high|medium|low|minimal|xhigh|max)$/i.exec(id)?.[1]?.toLowerCase()
+    out.push({ id, name, effort })
+  }
+  if (out.length) {
+    cachedModelCatalog = { agyPath, catalog: buildModelCatalog(out), at: Date.now() }
+  }
+}
 
 function modelFamilyId(model) {
   if (!model.effort) return ""
@@ -656,6 +672,8 @@ class Proc {
     this.configOptions = []
     this.configMethodUnsupported = false
     this.currentSelectionKey = null
+    this.appendable = false
+    this.resumable = false
     this.instructionsInSession = false
     this.resumed = false
     this.child = null
@@ -684,7 +702,7 @@ class Proc {
     allProcs.add(this)
   }
 
-  async start() {
+  async start(warmup = false) {
     await ensureControlServer()
     const bin = await ensureShimDir()
     const geminiDir = bridgeGeminiDir()
@@ -753,7 +771,7 @@ class Proc {
       )), timeoutMs)
     })
     try {
-      await Promise.race([this.#handshake(), timeout])
+      await Promise.race([this.#handshake(warmup), timeout])
     } catch (error) {
       if (this.dead && this.deadError && error !== this.deadError && !/timed out starting/.test(error.message)) {
         throw new Error(`agy failed before the ACP session started: ${this.deadError.message}`)
@@ -764,7 +782,7 @@ class Proc {
     }
   }
 
-  async #handshake() {
+  async #handshake(warmup = false) {
     const init = await this.conn.request("initialize", {
       protocolVersion: 1,
       // agy offers non-Gemini models only to allowlisted ACP clients.
@@ -775,15 +793,48 @@ class Proc {
     const capabilities = init?.agentCapabilities ?? {}
     this.supportsImages = capabilities.promptCapabilities?.image === true ||
       capabilities.prompt_capabilities?.image === true
-    const appendable = capabilities._meta?.antigravity?.systemPrompt?.append === true
-    const resumable = !!(capabilities.sessionCapabilities?.resume ?? capabilities.session_capabilities?.resume)
-    this.instructionsInSession = appendable && !!this.instructions
+    this.appendable = capabilities._meta?.antigravity?.systemPrompt?.append === true
+    this.resumable = !!(capabilities.sessionCapabilities?.resume ?? capabilities.session_capabilities?.resume)
+    if (warmup) {
+      const warmSession = await this.conn.request("session/new", { cwd: this.workspace, mcpServers: [] })
+      populateCatalogFromSessionModels(this.agyPath, warmSession?.models?.availableModels)
+      if (warmSession?.sessionId) {
+        await this.conn.request("session/close", { sessionId: warmSession.sessionId }).catch(() => {})
+        cleanupSessionData(warmSession.sessionId)
+      }
+      return
+    }
+    await this.bindSession(this.convKey)
+  }
+
+  async bindSession(convKey, opts = {}) {
+    this.convKey = convKey
+    if (opts.model !== undefined) this.model = opts.model
+    if (opts.selection !== undefined) this.selection = opts.selection || null
+    if (opts.workDir !== undefined) this.workDir = opts.workDir || null
+    if (opts.instructions !== undefined) this.instructions = opts.instructions || ""
+    if (opts.resume !== undefined) this.resumeFrom = opts.resume || null
+    if (opts.tools !== undefined) {
+      const nextTools = opts.tools || []
+      const nextSig = JSON.stringify(nextTools)
+      if (nextSig !== this.toolsSignature) {
+        this.tools = nextTools
+        this.toolsSignature = nextSig
+        this.toolsVersion++
+        for (const socket of this.watchers) {
+          try { socket.write(JSON.stringify({ event: "tools_changed" }) + "\n") } catch {}
+        }
+      }
+    }
+    this.lastUsed = Date.now()
+    this.instructionsInSession = this.appendable && !!this.instructions
     const meta = this.instructionsInSession
       ? { _meta: { antigravity: { systemPrompt: { append: this.instructions } } } }
       : {}
 
     let session = null
-    if (this.resumeFrom && resumable) {
+    this.resumed = false
+    if (this.resumeFrom && this.resumable) {
       try {
         session = await this.conn.request("session/resume", {
           sessionId: this.resumeFrom.sessionId,
@@ -806,6 +857,7 @@ class Proc {
       if (!session?.sessionId) throw new Error("agy session/new returned no sessionId")
       this.sessionId = session.sessionId
     }
+    populateCatalogFromSessionModels(this.agyPath, session?.models?.availableModels)
     // A resumed session reports the account default; always apply the selection.
     this.currentModel = session?.models?.currentModelId ?? null
     this.configOptions = Array.isArray(session?.configOptions) ? session.configOptions : []
@@ -888,6 +940,9 @@ class Proc {
   addWatcher(socket) {
     this.watchers.add(socket)
     socket.once("close", () => this.watchers.delete(socket))
+    if (this.listedVersion < this.toolsVersion) {
+      try { socket.write(JSON.stringify({ event: "tools_changed" }) + "\n") } catch {}
+    }
   }
 
   // Swap the client tool catalog in place; agy re-lists on tools/list_changed.
@@ -1690,6 +1745,10 @@ function unpark(convKey) {
 function park(proc) {
   if (!proc.canPark()) return
   loadParked()
+  const previous = parked.get(proc.convKey)
+  if (previous?.sessionId && previous.sessionId !== proc.sessionId) {
+    cleanupSessionData(previous.sessionId)
+  }
   parked.delete(proc.convKey)
   unparked.delete(proc.convKey)
   if (proc.expectedHistoryKey == null) proc.expectedHistoryKey = historyKey(proc.expectedMessages)
@@ -1719,8 +1778,54 @@ function takeParked(convKey, opts) {
   saveParked()
   if (Date.now() - entry.at > RESUME_TTL_MS || (entry.workDir ?? null) !== (opts.workDir ?? null) ||
     entry.instructionsHash !== digest(instructionsKey(opts.instructions)) ||
-    entry.historyHash !== digest(historyKey(opts.history))) return null
+    entry.historyHash !== digest(historyKey(opts.history))) {
+    if (entry.sessionId) cleanupSessionData(entry.sessionId)
+    return null
+  }
   return { sessionId: entry.sessionId, expectedMessages: opts.history }
+}
+
+let warmStandbyProc = null
+let warmStandbyPromise = null
+
+function warmStandbyEnabled() {
+  if (process.env.AGY_BRIDGE_WARM_STANDBY === "1") return true
+  if (process.env.AGY_BRIDGE_WARM_STANDBY === "0" || process.env.FAKE_AGY_LOG) return false
+  return true
+}
+
+function scheduleWarmStandby(agyPath) {
+  if (!agyPath || !warmStandbyEnabled()) return
+  if (warmStandbyProc && !warmStandbyProc.dead && !warmStandbyProc.retiring) return
+  if (warmStandbyPromise) return
+  if (allProcs.size >= MAX_IDLE_PROCS) return
+  const proc = new Proc(agyPath, "__standby__", {})
+  const p = proc.start(true).then(() => {
+    if (!proc.dead && !proc.retiring && warmStandbyPromise === p && !warmStandbyProc) {
+      warmStandbyProc = proc
+    } else {
+      proc.stop().catch(() => {})
+    }
+  }, () => {
+    proc.stop().catch(() => {})
+  }).finally(() => {
+    if (warmStandbyPromise === p) warmStandbyPromise = null
+  })
+  warmStandbyPromise = p
+}
+
+async function takeWarmStandby(agyPath) {
+  if (!warmStandbyEnabled()) return null
+  if (!warmStandbyProc && warmStandbyPromise) {
+    await warmStandbyPromise.catch(() => {})
+  }
+  if (warmStandbyProc) {
+    const proc = warmStandbyProc
+    warmStandbyProc = null
+    if (!proc.dead && !proc.retiring && proc.agyPath === agyPath) return proc
+    await proc.stop().catch(() => {})
+  }
+  return null
 }
 
 async function retire(key, proc) {
@@ -1738,6 +1843,11 @@ async function evictIdle() {
     if (proc.dead || (!proc.turn && proc.lastUsed < cutoff)) victims.push([key, proc])
   }
   for (const [key, proc] of victims) await retire(key, proc)
+  if (warmStandbyProc && (warmStandbyProc.dead || warmStandbyProc.lastUsed < cutoff)) {
+    const standby = warmStandbyProc
+    warmStandbyProc = null
+    await standby.stop().catch(() => {})
+  }
 }
 
 async function evictLRU() {
@@ -1809,14 +1919,31 @@ async function acquireProc(agyPath, convKey, opts, isFreshConversation, forceNew
         await existing.stop().catch(() => {})
       }
     }
+    const resume = forceNew || isFreshConversation ? null : takeParked(targetKey, opts)
+    const standby = await takeWarmStandby(agyPath)
+    if (standby) {
+      try {
+        await standby.bindSession(targetKey, { ...opts, resume })
+        pool.set(targetKey, standby)
+        scheduleWarmStandby(agyPath)
+        return { proc: standby, history: opts.history }
+      } catch {
+        await standby.stop().catch(() => {})
+      }
+    }
     while (allProcs.size >= MAX_IDLE_PROCS) {
+      if (warmStandbyProc) {
+        const victim = warmStandbyProc
+        warmStandbyProc = null
+        await victim.stop().catch(() => {})
+        continue
+      }
       if (await evictLRU()) continue
       if (allProcs.size >= MAX_PROCS) {
         throw new BusyError(`agy bridge: ${MAX_PROCS} agy processes are running and all have unfinished responses`)
       }
       break
     }
-    const resume = forceNew || isFreshConversation ? null : takeParked(targetKey, opts)
     const proc = new Proc(agyPath, targetKey, { ...opts, resume })
     try {
       await proc.start()
@@ -1825,6 +1952,7 @@ async function acquireProc(agyPath, convKey, opts, isFreshConversation, forceNew
       throw error
     }
     pool.set(targetKey, proc)
+    scheduleWarmStandby(agyPath)
     return { proc, history: opts.history }
   })
 }
@@ -2013,11 +2141,12 @@ function systemText(body) {
 }
 
 // The model is not part of the key: agy switches models inside a live session.
-function conversationKey(body) {
+function conversationKey(body, init) {
   const system = historyKey([{ role: "system", content: body.system || "" }])
   const first = body.messages?.[0]
   const firstText = first ? historyKey([first]) : ""
-  const discriminator = body.metadata?.user_id || body.metadata?.session_id || body.user || body.prompt_cache_key || ""
+  const headerSession = init?.headers ? String(new Headers(init.headers).get(SESSION_HEADER) || "").trim() : ""
+  const discriminator = headerSession || body.metadata?.user_id || body.metadata?.session_id || body.user || body.prompt_cache_key || ""
   const source = discriminator + "\n" + system + "\n===\n" + firstText
   return createHash("sha256").update(source).digest("hex")
 }
@@ -2332,21 +2461,27 @@ function stripAlmaAssistantNotification(text) {
 }
 
 // Normalize per-turn dynamic sections (e.g. Alma's <referenced_objects>,
-// <available_skills>, <relevant_memories>) so the same conversation keeps the
+// <available_skills>, <relevant_memories>, Codex's <codex_apps_client_time_context>,
+// and Magpie's dynamic placeholder notice) so the same conversation keeps the
 // same convKey and instructionsHash across turns.
 function instructionsKey(text) {
-  return String(text ?? "")
+  return stripMagpiePlaceholderNotice(String(text ?? ""))
     .replace(/<available_skills>[\s\S]*?<\/available_skills>/g, "<available_skills/>")
     .replace(/<referenced_objects>[\s\S]*?<\/referenced_objects>/g, "<referenced_objects/>")
     .replace(/<relevant_memories>[\s\S]*?<\/relevant_memories>/g, "<relevant_memories/>")
+    .replace(/<codex_apps_client_time_context(?:\s[^>]*)?>[\s\S]*?<\/codex_apps_client_time_context>/g, "<codex_apps_client_time_context/>")
     .replace(/\n## Relevant Memories[\s\S]*?(?=\n## |\n<[a-zA-Z_-]+>|$)/g, "\n## Relevant Memories")
     .trim()
 }
 
 function extractDynamicSystemBlocks(text) {
   if (!text) return ""
+  const str = String(text)
   const blocks = []
-  for (const match of String(text).matchAll(/<(referenced_objects|available_skills|relevant_memories)>[\s\S]*?<\/\1>/g)) {
+  if (str.includes(MAGPIE_PLACEHOLDER_NOTICE)) {
+    blocks.push(MAGPIE_PLACEHOLDER_NOTICE)
+  }
+  for (const match of str.matchAll(/<(referenced_objects|available_skills|relevant_memories|codex_apps_client_time_context)(?:\s[^>]*)?>[\s\S]*?<\/\1>/g)) {
     blocks.push(match[0])
   }
   return blocks.join("\n\n")
@@ -3524,6 +3659,11 @@ function streamResponse(proc, turn, body, signal) {
 export const AntigravityBridgePlugin = async () => {
   const readUsage = createUsageReader(findAgy)
   return {
+    "chat.headers": async (input, output) => {
+      const id = input?.model?.providerID ?? input?.provider?.info?.id
+      if (id !== PROVIDER_ID || !input?.sessionID) return
+      output.headers[SESSION_HEADER] = String(input.sessionID).slice(0, 128)
+    },
     auth: {
       provider: PROVIDER_ID,
       single: true,
@@ -3571,6 +3711,10 @@ export const AntigravityBridgePlugin = async () => {
         },
       ],
       loader: async () => {
+        if (warmStandbyEnabled()) {
+          const agy = findAgy()
+          if (agy) scheduleWarmStandby(agy)
+        }
         return {
           baseURL: "agy://local",
           apiKey: "agy",
@@ -3614,7 +3758,7 @@ export const AntigravityBridgePlugin = async () => {
             body = { ...body, model: requestedModel }
             const model = resolveAgyModel(await loadModelCatalog(agy), requestedModel, body)
             const selection = { model: requestedModel, effort: requestedEffort(body) }
-            const convKey = conversationKey(body)
+            const convKey = conversationKey(body, init)
             const trailing = trailingMessages(body)
             const isFresh = trailing.history.length === 0
             const resultBlocks = extractToolResults(body)
@@ -3677,6 +3821,16 @@ export const AntigravityBridgePlugin = async () => {
                     if (!proc.dead && !turn.done) {
                       // A changed tool catalog applies to the rest of this turn;
                       // a model change applies from the next prompt.
+                      const prevHasPlaceholder = String(proc.instructions || "").includes(MAGPIE_PLACEHOLDER_NOTICE)
+                      const nextHasPlaceholder = String(instructions || "").includes(MAGPIE_PLACEHOLDER_NOTICE)
+                      if (!prevHasPlaceholder && nextHasPlaceholder && results.length) {
+                        const alreadyInResults = results.some((item) =>
+                          (item.result?.content || []).some((part) => part?.type === "text" && part.text?.includes(MAGPIE_PLACEHOLDER_NOTICE)),
+                        )
+                        if (!alreadyInResults) {
+                          results = appendResultText(results, results.length - 1, `<system-reminder>\n${MAGPIE_PLACEHOLDER_NOTICE}\n</system-reminder>`)
+                        }
+                      }
                       proc.instructions = instructions
                       await proc.updateTools(tools)
                       proc.continueWith(results)
@@ -3779,7 +3933,9 @@ process.once("exit", () => {
     if (proc.workspace) {
       try { fs.rmSync(proc.workspace, { recursive: true, force: true }) } catch {}
     }
-    cleanupSessionData(proc.sessionId)
+    if (proc.sessionId && parked.get(proc.convKey)?.sessionId !== proc.sessionId) {
+      cleanupSessionData(proc.sessionId)
+    }
   }
   if (shimDir) {
     try { fs.rmSync(shimDir, { recursive: true, force: true }) } catch {}

@@ -12,8 +12,8 @@ const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "agy-compat-test-"))
 const entry = new URL("./index.mjs", import.meta.url)
 let source = fs.readFileSync(entry, "utf8")
 source = source.replace(/from "(\.\/[^"\n]+)"/g, (_, target) => `from ${JSON.stringify(new URL(target, entry).href)}`)
-fs.writeFileSync(path.join(workspace, "bridge.mjs"), source + "\nexport { inspectToolTurn, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, withStateLock, Turn, translateUsage, conversationKey };\n")
-const { inspectToolTurn, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, withStateLock, Turn, translateUsage, conversationKey } = await import(pathToFileURL(path.join(workspace, "bridge.mjs")).href)
+fs.writeFileSync(path.join(workspace, "bridge.mjs"), source + "\nexport { inspectToolTurn, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, withStateLock, Turn, translateUsage, conversationKey, instructionsKey, extractDynamicSystemBlocks, MAGPIE_PLACEHOLDER_NOTICE };\n")
+const { inspectToolTurn, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, withStateLock, Turn, translateUsage, conversationKey, instructionsKey, extractDynamicSystemBlocks, MAGPIE_PLACEHOLDER_NOTICE, AntigravityBridgePlugin } = await import(pathToFileURL(path.join(workspace, "bridge.mjs")).href)
 after(() => fs.rmSync(workspace, { recursive: true, force: true }))
 
 const image = { type: "image", source: { type: "base64", media_type: "image/png", data: "aW1hZ2VB" } }
@@ -164,4 +164,24 @@ test("conversationKey discriminates conversations using session_id, user, and pr
 
   const keys = [keyBase, keyUserId, keySessionId, keyUser, keyPromptCacheKey]
   assert.equal(new Set(keys).size, keys.length, "each discriminator should produce a unique conversationKey")
+})
+
+test("chat.headers hook passes Magpie sessionID to conversationKey and instructionsKey ignores dynamic masking/time blocks", async () => {
+  const plugin = await AntigravityBridgePlugin()
+  const out = { headers: {} }
+  await plugin["chat.headers"]({ model: { providerID: "agy-acp" }, sessionID: "magpie-sess-001" }, out)
+  assert.equal(out.headers["x-magpie-agy-session"], "magpie-sess-001")
+
+  const base = {
+    system: "You are a helpful coding assistant.",
+    messages: [{ role: "user", content: "Hello" }],
+  }
+  const keyWithHeader = conversationKey(base, { headers: out.headers })
+  const keyWithoutHeader = conversationKey(base, {})
+  assert.notEqual(keyWithHeader, keyWithoutHeader)
+
+  const sysPlain = "Base system prompt\n<codex_apps_client_time_context>2026-11-06T01:00:00Z</codex_apps_client_time_context>"
+  const sysMaskedAndLater = `Base system prompt\n<codex_apps_client_time_context>2026-11-06T02:00:00Z</codex_apps_client_time_context>\n\n${MAGPIE_PLACEHOLDER_NOTICE}`
+  assert.equal(instructionsKey(sysPlain), instructionsKey(sysMaskedAndLater))
+  assert.ok(extractDynamicSystemBlocks(sysMaskedAndLater).includes(MAGPIE_PLACEHOLDER_NOTICE))
 })
