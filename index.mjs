@@ -10,7 +10,7 @@ import { createUsageReader } from "./usage.mjs"
 
 const PROVIDER_ID = "agy-acp"
 const AGENT_NAME = "magpie-bridge"
-const SESSION_HEADER = "x-magpie-agy-session"
+const SESSION_HEADER = "x-magpie-session"
 const MCP_SERVER_PATH = fileURLToPath(new URL("./mcp-server.mjs", import.meta.url))
 // agy exposes tools from the --ide-mcp-port server as direct functions with this prefix.
 const IDE_TOOL_PREFIX = "mcp_ide-tools_"
@@ -2075,10 +2075,16 @@ function renderServerAssistantBlock(block) {
 
 const MAGPIE_PLACEHOLDER_NOTICE = "Values written like {{NAME_ab12cd34}} are placeholders for real values. Use them exactly as written, in replies and in tool calls alike: they are filled in with the real values before anything runs. Don't ask to verify them, and don't replace them with examples."
 const MAGPIE_PLACEHOLDER_NOTICE_RE = /(?:^|\n\n)Values written like \{\{NAME_ab12cd34\}\} are placeholders for real values\. Use them exactly as written, in replies and in tool calls alike: they are filled in with the real values before anything runs\. Don't ask to verify them, and don't replace them with examples\.(?=\s|$)/g
+const MAGPIE_PLACEHOLDER_TOKEN_RE = /\{\{([A-Z]+(?:_[A-Z0-9]+)*)_[a-z0-9]{6,12}\}\}/g
 
 function stripMagpiePlaceholderNotice(text) {
   if (typeof text !== "string" || !text.includes("{{NAME_ab12cd34}}")) return text
   return text.replace(MAGPIE_PLACEHOLDER_NOTICE_RE, "")
+}
+
+function normalizeMagpiePlaceholders(text) {
+  if (typeof text !== "string" || !text.includes("{{")) return text
+  return text.replace(MAGPIE_PLACEHOLDER_TOKEN_RE, "{{$1}}")
 }
 
 // Compare conversation content, not transport metadata or client-assigned IDs.
@@ -2128,8 +2134,8 @@ function historyKey(messages) {
     row.content = row.content.filter((block) => {
       if (block.type !== "text") return true
       let text = block.text
-      if (row.role === "user") text = stripHistoricalAlmaContext(text)
-      else if (row.role === "assistant") text = stripAlmaAssistantNotification(text)
+      if (row.role === "user") text = normalizeMagpiePlaceholders(stripHistoricalAlmaContext(text))
+      else if (row.role === "assistant") text = normalizeMagpiePlaceholders(stripAlmaAssistantNotification(text))
       else if (row.role === "system") text = instructionsKey(text)
       block.text = text.trim()
       return block.text !== ""
@@ -2184,9 +2190,12 @@ function conversationKey(body, init) {
   const system = historyKey([{ role: "system", content: body.system || "" }])
   const first = body.messages?.[0]
   const firstText = first ? historyKey([first]) : ""
-  const rawHeaderSession = init?.headers ? String(new Headers(init.headers).get(SESSION_HEADER) || "").trim() : ""
+  const headers = init?.headers ? new Headers(init.headers) : null
+  const rawHeaderSession = headers ? String(headers.get(SESSION_HEADER) || "").trim() : ""
   const headerSession = /^magpie-[0-9a-f]{24}$/i.test(rawHeaderSession) ? "" : rawHeaderSession
-  const discriminator = headerSession || body.metadata?.user_id || body.metadata?.session_id || body.user || body.prompt_cache_key || ""
+  const subagent = headers ? String(headers.get("x-magpie-subagent") || "").trim() : ""
+  const sessionDiscriminator = headerSession ? (subagent ? `${headerSession}:sub:${subagent}` : headerSession) : ""
+  const discriminator = sessionDiscriminator || body.metadata?.user_id || body.metadata?.session_id || body.user || body.prompt_cache_key || ""
   const source = discriminator + "\n" + system + "\n===\n" + firstText
   return createHash("sha256").update(source).digest("hex")
 }
@@ -2491,7 +2500,7 @@ function sessionInstructions(body, callerWorkDir) {
 
 function stripHistoricalAlmaContext(text) {
   return String(text ?? "").replace(
-    /(?:^|\r?\n)\s*\[Context:\s*<reminder>Authoritative Local DateTime:[\s\S]*?\]\r?\n\r?\n(?=\[Message sent-at:)/g,
+    /(?:^|\r?\n)\s*\[Context:\s*<reminder>Authoritative Local DateTime:[\s\S]*?(?=\s*\[Message sent-at:|$)/g,
     "",
   )
 }
@@ -2505,7 +2514,7 @@ function stripAlmaAssistantNotification(text) {
 // and Magpie's dynamic placeholder notice) so the same conversation keeps the
 // same convKey and instructionsHash across turns.
 function instructionsKey(text) {
-  return stripMagpiePlaceholderNotice(String(text ?? ""))
+  return normalizeMagpiePlaceholders(stripMagpiePlaceholderNotice(String(text ?? "")))
     .replace(/<available_skills>[\s\S]*?<\/available_skills>/g, "<available_skills/>")
     .replace(/<referenced_objects>[\s\S]*?<\/referenced_objects>/g, "<referenced_objects/>")
     .replace(/<relevant_memories>[\s\S]*?<\/relevant_memories>/g, "<relevant_memories/>")
@@ -3699,11 +3708,6 @@ function streamResponse(proc, turn, body, signal) {
 export const AntigravityBridgePlugin = async () => {
   const readUsage = createUsageReader(findAgy)
   return {
-    "chat.headers": async (input, output) => {
-      const id = input?.model?.providerID ?? input?.provider?.info?.id
-      if (id !== PROVIDER_ID || !input?.sessionID) return
-      output.headers[SESSION_HEADER] = String(input.sessionID).slice(0, 128)
-    },
     auth: {
       provider: PROVIDER_ID,
       single: true,

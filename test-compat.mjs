@@ -166,27 +166,45 @@ test("conversationKey discriminates conversations using session_id, user, and pr
   assert.equal(new Set(keys).size, keys.length, "each discriminator should produce a unique conversationKey")
 })
 
-test("chat.headers hook passes Magpie sessionID to conversationKey and instructionsKey ignores dynamic masking/time blocks", async () => {
+test("x-magpie-session header and instructionsKey/historyKey normalize dynamic masking, Alma context, and time blocks", async () => {
   const plugin = await AntigravityBridgePlugin()
-  const out = { headers: {} }
-  await plugin["chat.headers"]({ model: { providerID: "agy-acp" }, sessionID: "magpie-sess-001" }, out)
-  assert.equal(out.headers["x-magpie-agy-session"], "magpie-sess-001")
+  assert.equal(plugin["chat.headers"], undefined)
 
   const base = {
     system: "You are a helpful coding assistant.",
     messages: [{ role: "user", content: "Hello" }],
   }
-  const keyWithHeader = conversationKey(base, { headers: out.headers })
+  const keyWithHeader = conversationKey(base, { headers: { "x-magpie-session": "real-sess-001" } })
+  const keyWithSubagent = conversationKey(base, { headers: { "x-magpie-session": "real-sess-001", "x-magpie-subagent": "sub-1" } })
   const keyWithoutHeader = conversationKey(base, {})
   assert.notEqual(keyWithHeader, keyWithoutHeader)
+  assert.notEqual(keyWithHeader, keyWithSubagent)
 
-  const keySyntheticA = conversationKey(base, { headers: { "x-magpie-agy-session": "magpie-895e850341afd28a69ad4cf6" } })
-  const keySyntheticB = conversationKey(base, { headers: { "x-magpie-agy-session": "magpie-4f111a4bff02f8e44e83c625" } })
+  const keySyntheticA = conversationKey(base, { headers: { "x-magpie-session": "magpie-895e850341afd28a69ad4cf6" } })
+  const keySyntheticB = conversationKey(base, { headers: { "x-magpie-session": "magpie-4f111a4bff02f8e44e83c625" } })
   assert.equal(keySyntheticA, keyWithoutHeader)
   assert.equal(keySyntheticB, keyWithoutHeader)
 
-  const sysPlain = "Base system prompt\n<codex_apps_client_time_context>2026-11-06T01:00:00Z</codex_apps_client_time_context>"
-  const sysMaskedAndLater = `Base system prompt\n<codex_apps_client_time_context>2026-11-06T02:00:00Z</codex_apps_client_time_context>\n\n${MAGPIE_PLACEHOLDER_NOTICE}`
+  const sysPlain = "You are {{PERSON_iekwuhjr}}\n<codex_apps_client_time_context>2026-11-06T01:00:00Z</codex_apps_client_time_context>"
+  const sysMaskedAndLater = `You are {{PERSON_ohnu7ekb}}\n<codex_apps_client_time_context>2026-11-06T02:00:00Z</codex_apps_client_time_context>\n\n${MAGPIE_PLACEHOLDER_NOTICE}`
   assert.equal(instructionsKey(sysPlain), instructionsKey(sysMaskedAndLater))
   assert.ok(extractDynamicSystemBlocks(sysMaskedAndLater).includes(MAGPIE_PLACEHOLDER_NOTICE))
+
+  const almaMsgA = {
+    role: "user",
+    content: [
+      { type: "text", text: "[Context: <reminder>Authoritative Local DateTime: 2026-11-06 03:27:41</reminder>]\n\n## Relevant Memories\n1. user{{ACCOUNT_t4bc7dsi}}" },
+      { type: "text", text: "[Message sent-at: 2026-11-06 03:27:38 Fri]" },
+      { type: "text", text: `test\n\n${MAGPIE_PLACEHOLDER_NOTICE}` },
+    ],
+  }
+  const almaMsgB = {
+    role: "user",
+    content: [
+      { type: "text", text: "[Context: <reminder>Authoritative Local DateTime: 2026-11-06 03:28:19</reminder>]\n\n## Relevant Memories\n1. user{{ACCOUNT_zzzz9999}}" },
+      { type: "text", text: "[Message sent-at: 2026-11-06 03:27:38 Fri]" },
+      { type: "text", text: "test" },
+    ],
+  }
+  assert.equal(historyKey([almaMsgA]), historyKey([almaMsgB]))
 })
