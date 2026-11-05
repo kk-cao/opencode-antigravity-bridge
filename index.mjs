@@ -200,7 +200,9 @@ function buildModelCatalog(list) {
     const sorted = [...family].sort((a, b) => EFFORT_ORDER.indexOf(a.effort) - EFFORT_ORDER.indexOf(b.effort))
     const efforts = sorted.map(variant => variant.effort)
     const byEffort = new Map(sorted.map(variant => [variant.effort, variant.id]))
-    const defaultEffort = byEffort.has("high") ? "high" : efforts[efforts.length - 1]
+    const defaultEffort = /flash/i.test(id)
+      ? (byEffort.has("low") ? "low" : efforts[0])
+      : (byEffort.has("high") ? "high" : efforts[efforts.length - 1])
     const defaultModel = sorted.find(variant => variant.effort === defaultEffort)
     const baseName = defaultModel.name.replace(/\s+\((?:minimal|low|medium|high|xhigh|max)\)$/i, "").trim()
     models.push({
