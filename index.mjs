@@ -2174,7 +2174,8 @@ function conversationKey(body, init) {
   const system = historyKey([{ role: "system", content: body.system || "" }])
   const first = body.messages?.[0]
   const firstText = first ? historyKey([first]) : ""
-  const headerSession = init?.headers ? String(new Headers(init.headers).get(SESSION_HEADER) || "").trim() : ""
+  const rawHeaderSession = init?.headers ? String(new Headers(init.headers).get(SESSION_HEADER) || "").trim() : ""
+  const headerSession = /^magpie-[0-9a-f]{24}$/i.test(rawHeaderSession) ? "" : rawHeaderSession
   const discriminator = headerSession || body.metadata?.user_id || body.metadata?.session_id || body.user || body.prompt_cache_key || ""
   const source = discriminator + "\n" + system + "\n===\n" + firstText
   return createHash("sha256").update(source).digest("hex")

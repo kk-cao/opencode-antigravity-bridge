@@ -180,6 +180,11 @@ test("chat.headers hook passes Magpie sessionID to conversationKey and instructi
   const keyWithoutHeader = conversationKey(base, {})
   assert.notEqual(keyWithHeader, keyWithoutHeader)
 
+  const keySyntheticA = conversationKey(base, { headers: { "x-magpie-agy-session": "magpie-895e850341afd28a69ad4cf6" } })
+  const keySyntheticB = conversationKey(base, { headers: { "x-magpie-agy-session": "magpie-4f111a4bff02f8e44e83c625" } })
+  assert.equal(keySyntheticA, keyWithoutHeader)
+  assert.equal(keySyntheticB, keyWithoutHeader)
+
   const sysPlain = "Base system prompt\n<codex_apps_client_time_context>2026-11-06T01:00:00Z</codex_apps_client_time_context>"
   const sysMaskedAndLater = `Base system prompt\n<codex_apps_client_time_context>2026-11-06T02:00:00Z</codex_apps_client_time_context>\n\n${MAGPIE_PLACEHOLDER_NOTICE}`
   assert.equal(instructionsKey(sysPlain), instructionsKey(sysMaskedAndLater))
