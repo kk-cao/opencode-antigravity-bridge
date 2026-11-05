@@ -531,8 +531,8 @@ const echoTool = {
     additionalProperties: false,
   },
 }
-const model = "antigravity-bridge/gemini-test"
-const legacyModel = "antigravity-bridge/gemini-test-low"
+const model = "agy-acp/gemini-test"
+const legacyModel = "agy-acp/gemini-test-low"
 
 {
   const usage = await plugin.auth.usage(async () => ({ key: "agy" }), {})
@@ -571,7 +571,7 @@ async function launchedModel(body) {
   check("high thinking budget selects high", await launchedModel({ model, thinking: { type: "enabled", budget_tokens: 24000 }, messages: [{ role: "user", content: "MODEL high effort" }] }) === "gemini-test-high")
   check("output effort without thinking keeps the default", await launchedModel({ model, output_config: { effort: "low" }, messages: [{ role: "user", content: "MODEL title request" }] }) === "gemini-test-high")
   check("legacy effort ids pass through unchanged", await launchedModel({ model: legacyModel, thinking: { type: "enabled", budget_tokens: 10000 }, messages: [{ role: "user", content: "MODEL legacy id" }] }) === "gemini-test-low")
-  check("single-effort model requests pass through unchanged", await launchedModel({ model: "antigravity-bridge/claude-test-medium", thinking: { type: "enabled", budget_tokens: 4096 }, messages: [{ role: "user", content: "MODEL singleton" }] }) === "claude-test-medium")
+  check("single-effort model requests pass through unchanged", await launchedModel({ model: "agy-acp/claude-test-medium", thinking: { type: "enabled", budget_tokens: 4096 }, messages: [{ role: "user", content: "MODEL singleton" }] }) === "claude-test-medium")
   check("modern sessions select models and levels through ACP config options", logs().some(event => event.type === "setConfig" && event.configId === "model") && logs().some(event => event.type === "setConfig" && event.configId === "thought_level" && event.value === "low"))
   check("modern model selection does not call legacy set_model", !logs().some(event => event.type === "setModel"), JSON.stringify(logs().filter(event => event.type === "setModel")))
 }
@@ -1850,7 +1850,7 @@ for (const location of ["inline", "system", "developer", "user"]) {
   // type:"prompt" hook request with claude-haiku small-fast model alias + output_config.format json_schema,
   // plus historical server_tool_use/web_search_tool_result and search_result blocks.
   const promptHookRes = await callFetch({
-    model: "antigravity-bridge/claude-haiku-4-5-20251001",
+    model: "agy-acp/claude-haiku-4-5-20251001",
     stream: false,
     output_config: {
       format: {
