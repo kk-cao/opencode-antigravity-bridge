@@ -220,6 +220,12 @@ async function loadModelCatalog(agyPath, refresh = false) {
   if (cachedModelCatalog?.agyPath === agyPath && (!refresh || now - cachedModelCatalog.at < MODEL_CATALOG_TTL_MS)) {
     return cachedModelCatalog.catalog
   }
+  if (!process.env.FAKE_AGY_LOG) {
+    if (!cachedModelCatalog || cachedModelCatalog.agyPath !== agyPath) {
+      cachedModelCatalog = { agyPath, catalog: buildModelCatalog(FALLBACK_MODELS), at: now }
+    }
+    return cachedModelCatalog.catalog
+  }
   if (pendingModelCatalog?.agyPath === agyPath) return pendingModelCatalog.promise
   const promise = (async () => {
     const catalog = buildModelCatalog(await listAgyModels(agyPath))
@@ -1789,6 +1795,7 @@ function takeParked(convKey, opts) {
 
 let warmStandbyProc = null
 let warmStandbyPromise = null
+let warmStandbyTimer = null
 
 function warmStandbyEnabled() {
   if (process.env.AGY_BRIDGE_WARM_STANDBY === "1") return true
@@ -1796,30 +1803,50 @@ function warmStandbyEnabled() {
   return true
 }
 
-function scheduleWarmStandby(agyPath) {
+function scheduleWarmStandby(agyPath, delayMs = 3000) {
   if (!agyPath || !warmStandbyEnabled()) return
   if (warmStandbyProc && !warmStandbyProc.dead && !warmStandbyProc.retiring) return
   if (warmStandbyPromise) return
-  if (allProcs.size >= MAX_IDLE_PROCS) return
-  const proc = new Proc(agyPath, "__standby__", {})
-  const p = proc.start(true).then(() => {
-    if (!proc.dead && !proc.retiring && warmStandbyPromise === p && !warmStandbyProc) {
-      warmStandbyProc = proc
-    } else {
-      proc.stop().catch(() => {})
+  if (warmStandbyTimer) clearTimeout(warmStandbyTimer)
+  const run = () => {
+    warmStandbyTimer = null
+    if (!warmStandbyEnabled()) return
+    if (warmStandbyProc && !warmStandbyProc.dead && !warmStandbyProc.retiring) return
+    if (warmStandbyPromise) return
+    if (allProcs.size >= MAX_IDLE_PROCS) return
+    for (const p of pool.values()) {
+      if (p.turn && !p.dead) {
+        scheduleWarmStandby(agyPath, 3000)
+        return
+      }
     }
-  }, () => {
-    proc.stop().catch(() => {})
-  }).finally(() => {
-    if (warmStandbyPromise === p) warmStandbyPromise = null
-  })
-  warmStandbyPromise = p
+    const proc = new Proc(agyPath, "__standby__", {})
+    const p = proc.start(true).then(() => {
+      if (!proc.dead && !proc.retiring && warmStandbyPromise === p && !warmStandbyProc) {
+        warmStandbyProc = proc
+      } else {
+        proc.stop().catch(() => {})
+      }
+    }, () => {
+      proc.stop().catch(() => {})
+    }).finally(() => {
+      if (warmStandbyPromise === p) warmStandbyPromise = null
+    })
+    warmStandbyPromise = p
+  }
+  if (delayMs > 0) {
+    warmStandbyTimer = setTimeout(run, delayMs)
+    warmStandbyTimer.unref?.()
+  } else {
+    run()
+  }
 }
 
 async function takeWarmStandby(agyPath) {
   if (!warmStandbyEnabled()) return null
-  if (!warmStandbyProc && warmStandbyPromise) {
-    await warmStandbyPromise.catch(() => {})
+  if (warmStandbyTimer) {
+    clearTimeout(warmStandbyTimer)
+    warmStandbyTimer = null
   }
   if (warmStandbyProc) {
     const proc = warmStandbyProc
