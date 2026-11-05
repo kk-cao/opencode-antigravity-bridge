@@ -1,4 +1,55 @@
+## 2026-11-05：整合 PR #4 与 agy 1.5.0，维护者追加修复
+
+本段更新此前记录：输入 schema 现在做 Gemini/Vertex 兼容化处理（不是完整
+schema 校验），用户图片通过协商后的 ACP image capability 发送；旧版一律 400
+和 schema 不删字段的记录仅描述当时行为。
+
+- 同步随后合入 main 的中文 README，英文技术说明更新到 README.en.md。
+- 原作者 gitxm 的六个提交完整保留；合并当前 main，保留模型/thought_level
+  的 `session/set_config_option`、旧协议回退、图片能力声明和既有 1.5.0 测试。
+- 工具 companion 绑定到实际前序结果；无匹配 Skill/ToolSearch/图片的文本拒绝。
+  Skill 无标记的任意文本不再当工具输出；带明确头部的 prompt 仍支持。
+- 排队消息共用同一解析器；图片历史重放保留相邻文本、嵌套工具图片的原始数据。
+  部分重写工具 ID 的批次以完整历史匹配，并保留未重写 ID 的会话约束。
+- 状态文件锁拿不到时跳过保存，不偷取仍存活进程的锁；过期且 owner 已退出
+  的锁可恢复。通用 reasoning effort 参数无需 Anthropic thinking envelope，
+  既有 output_config.effort gating 保留。
+- 新增 platform.mjs：Windows exe/cmd/bat 发现、cmd 参数转义、nc.cmd 路径处理。
+  命令构造已测试，未进行 Windows 实机端到端验证。
+- Node/Bun：各 266 smoke checks + 25 focused tests 通过。Linux 真机 agy
+  1.5.0：图片识别、原生 MCP 工具调用、跨进程 resume、思考等级变更通过；
+  Flash 未输出思考摘要，不宣称本轮验证了思考文本。
+
 # Handoff: opencode-antigravity-bridge
+
+## 2026-11-04：agy 1.5.0 图片输入和 ACP 配置选项
+
+- 图片：内联 base64 PNG/JPEG/GIF/WebP 转 ACP image，保持文本/图片顺序，覆盖
+  首轮、续聊和历史重放。启动握手必须声明 `promptCapabilities.image`，否则
+  返回真实 HTTP 400；URL、无效 base64 和用户 document 仍拒绝。Gemini/Claude
+  模型声明 `capabilities.input.image`。历史比较忽略图片 cache metadata，落盘仍只存哈希。
+- 模型/思考等级：优先读 ACP `model`、`thought_level` select 配置，经
+  `session/set_config_option` 设置。支持分组、按 category 找自定义 ID、模型切换
+  后刷新可选等级，以及 `config_option_update` 通知。只有缺选项/Method not found
+  时兼容 `session/set_model`，真实错误不静默回退。初始模型目录仍由 `agy models`
+  发现；显式 legacy ID 保持原有等级语义。
+- `test-integration.mjs`：显式 `AGY_BRIDGE_INTEGRATION=1 npm run test:integration`
+  才运行，使用真实额度，私有临时 bridge state；两个 Node 进程验证图片识别、
+  一次 MCP 工具往返、文本/usage 和跨进程续接后的图片/工具记忆、等级变化。
+  `AGY_BRIDGE_TEST_MODEL` 可指定模型，`AGY_BRIDGE_TEST_USAGE=1` 加测真实额度。
+- 验证：Node **208 smoke checks + 14 quota tests**。真实 Linux agy **1.5.0**
+  + Gemini 3.8 Flash、Gemini 4 Argon 均通过上述集成检查；独立控制面探针通过
+  Gemini/Claude 配置切换及 high/low 等级切换。两个模型的首轮均未发思考摘要。
+  当前环境没有 Bun。
+- Argon 曾在 ACP 启动阶段超出 60 秒；续跑时独立探针创建会话约 15 秒，配置
+  切换为毫秒级，随后完整集成检查通过。原超时未复现，原因未定，未放宽默认时限。
+- 额度查询：此前真实 Google eligibility 请求 EOF，最终 quota hook 重试在 18 秒
+  预算内超时，尚未取得 1.5.0 的成功 quota report；parser 和 18 秒上限未改。
+  未重测 1.5.0 动态工具目录、取消和超长工具，也未测 GUI。
+- 本机 agy 包装器原指向未运行的 127.0.0.1:7890；真机验证仅对子进程传
+  `AGY_PROXY` 使用可用代理，未改全局配置。未发布或替换已安装插件。
+
+详细评估和未验证项：`docs/plans/2026-11-04-agy-1.5.0-compatibility.md`。
 
 ## 2026-11-03：传输层重构为 ACP（`agy acp`），参考 T3 Code
 
