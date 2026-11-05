@@ -433,6 +433,7 @@ class Turn {
     this.calls = []
     this.awaitCalls = []
     this.lateWaiters = []
+    this.toolSteps = 0
     this.attached = false
     this.done = false
     this.finalized = false
@@ -810,7 +811,34 @@ class Proc {
   matchesHistory(messages) {
     if (this.historyInvalid) return false
     if (this.expectedMessages == null) return !this.turn && !this.hasSentFirstTurn
+    this.#syncClientToolInputs(messages)
     return historyKey(this.expectedMessages) === historyKey(messages)
+  }
+
+  // Clients such as Alma validate tool_use inputs through Zod schemas that fill
+  // in default properties (e.g. run_in_background: false) before echoing the
+  // assistant message back with tool_result. Adopt those client-defaulted inputs
+  // when every argument agy actually emitted is unchanged.
+  #syncClientToolInputs(messages) {
+    if (!Array.isArray(this.expectedMessages) || !Array.isArray(messages)) return
+    const expUses = this.expectedMessages.flatMap((msg) =>
+      msg?.role === "assistant" && Array.isArray(msg.content) ? msg.content.filter((b) => b?.type === "tool_use") : [],
+    )
+    const msgUses = messages.flatMap((msg) =>
+      msg?.role === "assistant" && Array.isArray(msg.content) ? msg.content.filter((b) => b?.type === "tool_use") : [],
+    )
+    if (expUses.length !== msgUses.length) return
+    for (let j = 0; j < expUses.length; j++) {
+      const a = expUses[j]
+      const b = msgUses[j]
+      if (a.name !== b.name) continue
+      const aIn = a.input ?? {}
+      const bIn = b.input ?? {}
+      if (typeof aIn === "object" && typeof bIn === "object" && !Array.isArray(aIn) && !Array.isArray(bIn)) {
+        const isSubset = Object.keys(aIn).every((k) => k in bIn && stableJSON(aIn[k]) === stableJSON(bIn[k]))
+        if (isSubset) a.input = bIn
+      }
+    }
   }
 
   recordToolResults(turn, messages) {
@@ -1288,7 +1316,7 @@ function park(proc) {
     key: proc.convKey,
     sessionId: proc.sessionId,
     historyHash: digest(historyKey(proc.expectedMessages)),
-    instructionsHash: digest(proc.instructions),
+    instructionsHash: digest(instructionsKey(proc.instructions)),
     workDir: proc.workDir,
     at: Date.now(),
   })
@@ -1304,7 +1332,7 @@ function takeParked(convKey, opts) {
   unparked.add(convKey)
   saveParked()
   if (Date.now() - entry.at > RESUME_TTL_MS || (entry.workDir ?? null) !== (opts.workDir ?? null) ||
-    entry.instructionsHash !== digest(opts.instructions) ||
+    entry.instructionsHash !== digest(instructionsKey(opts.instructions)) ||
     entry.historyHash !== digest(historyKey(opts.history))) return null
   return { sessionId: entry.sessionId, expectedMessages: opts.history }
 }
@@ -1367,7 +1395,8 @@ async function acquireProc(agyPath, convKey, opts, isFreshConversation, forceNew
         throw new BusyError("agy bridge: this conversation still has an unfinished response")
       }
       const compatible = !forceNew && !existing.dead && !existing.retiring &&
-        existing.workDir === opts.workDir && existing.instructions === opts.instructions &&
+        existing.workDir === opts.workDir &&
+        instructionsKey(existing.instructions) === instructionsKey(opts.instructions) &&
         existing.matchesHistory(opts.history)
       if (compatible && !(isFreshConversation && existing.hasSentFirstTurn)) {
         await existing.updateTools(opts.tools)
@@ -1433,7 +1462,15 @@ function historyKey(messages) {
     }
   }
   for (const row of rows) {
-    row.content = row.content.filter(block => block.type !== "text" || (block.text = block.text.trim()) !== "")
+    row.content = row.content.filter((block) => {
+      if (block.type !== "text") return true
+      let text = block.text
+      if (row.role === "user") text = stripHistoricalAlmaContext(text)
+      else if (row.role === "assistant") text = stripAlmaAssistantNotification(text)
+      else if (row.role === "system") text = instructionsKey(text)
+      block.text = text.trim()
+      return block.text !== ""
+    })
   }
   return stableJSON(rows.filter(row => row.content.length))
 }
@@ -1527,7 +1564,22 @@ function imageBlock(block) {
   throw new UnsupportedContent("an image block without base64 source data")
 }
 
-function blockText(block) {
+// agy truncates a single USER_INPUT prompt at ~192,000 UTF-8 bytes from the tail,
+// which would chop off <current_turn> when replaying a tool-heavy conversation.
+const MAX_INITIAL_PROMPT_BYTES = positiveTimeout(process.env.AGY_BRIDGE_MAX_INITIAL_PROMPT_BYTES, 140_000)
+const MAX_HISTORICAL_TOOL_RESULT_CHARS = 3_000
+const MAX_CURRENT_EARLIER_TOOL_RESULT_CHARS = 12_000
+
+function compactMiddleText(text, maxChars, label = "historical tool output") {
+  const str = String(text ?? "")
+  if (!Number.isFinite(maxChars) || maxChars <= 0 || str.length <= maxChars) return str
+  const half = Math.max(200, Math.floor((maxChars - 160) / 2))
+  const omitted = str.length - half * 2
+  if (omitted <= 0) return str
+  return `${str.slice(0, half)}\n...[${label} compacted (${omitted} chars omitted to preserve recent conversation context)]...\n${str.slice(str.length - half)}`
+}
+
+function blockText(block, opts = {}) {
   if (typeof block === "string") return block
   if (!block || typeof block !== "object" || Array.isArray(block)) {
     throw new UnsupportedContent("a non-object content block")
@@ -1538,12 +1590,15 @@ function blockText(block) {
     return "[image]"
   }
   if (block.type === "tool_result") {
-    const inner = Array.isArray(block.content)
+    const rawInner = Array.isArray(block.content)
       ? block.content.map((part) => {
         if (part?.type === "image") return "[image returned by tool]"
         return blockText(part)
       }).join("")
       : String(block.content ?? "")
+    const inner = opts.maxToolResultChars
+      ? compactMiddleText(rawInner, opts.maxToolResultChars, opts.toolResultLabel || "historical tool output")
+      : rawInner
     return `[tool result${block.tool_use_id ? " id=" + block.tool_use_id : ""}]\n${inner}\n[end of tool result]`
   }
   if (block.type === "document") {
@@ -1558,10 +1613,10 @@ function messageImages(message) {
   return message.content.filter(block => block?.type === "image").map(imageBlock)
 }
 
-function messageText(message) {
+function messageText(message, opts = {}) {
   if (typeof message.content === "string") return message.content
   if (Array.isArray(message.content)) {
-    return message.content.filter(block => block?.type !== "image").map(blockText).join("")
+    return message.content.filter(block => block?.type !== "image").map(block => blockText(block, opts)).join("")
   }
   return String(message.content ?? "")
 }
@@ -1572,9 +1627,13 @@ function renderAssistantTurn(message) {
     ? message.content
     : [{ type: "text", text: String(message.content ?? "") }]
   for (const block of blocks) {
-    if (block.type === "text") parts.push(block.text || "")
+    if (block.type === "text") parts.push(stripAlmaAssistantNotification(block.text || ""))
     else if (block.type === "tool_use") {
-      parts.push(`[tool call ${block.name} id=${block.id || ""} args=${JSON.stringify(block.input ?? {})}]`)
+      if (block.name === "AttemptCompletion" && typeof block.input?.result === "string") {
+        parts.push(stripAlmaAssistantNotification(block.input.result))
+      } else {
+        parts.push(`[tool call ${block.name} id=${block.id || ""} args=${JSON.stringify(block.input ?? {})}]`)
+      }
     }
   }
   return parts.join("\n")
@@ -1593,41 +1652,172 @@ function sessionInstructions(body, callerWorkDir) {
   return parts.join("\n\n")
 }
 
+function isPureToolResultMessage(message) {
+  return message?.role === "user" && Array.isArray(message.content) &&
+    message.content.length > 0 && message.content.every((block) => block?.type === "tool_result")
+}
+
+function currentTurnStartIndex(messages) {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]?.role === "user" && !isPureToolResultMessage(messages[i])) return i
+  }
+  return Math.max(0, messages.length - 1)
+}
+
+function stripHistoricalAlmaContext(text) {
+  return String(text ?? "").replace(
+    /^\s*\[Context:\s*<reminder>Authoritative Local DateTime:[\s\S]*?\]\r?\n\r?\n(?=\[Message sent-at:)/,
+    "",
+  )
+}
+
+function stripAlmaAssistantNotification(text) {
+  return String(text ?? "").replace(/\s*<alma_notification>[\s\S]*?<\/alma_notification>\s*/g, "")
+}
+
+// Normalize per-turn dynamic sections (e.g. Alma's <referenced_objects>,
+// <available_skills>, <relevant_memories>) so the same conversation keeps the
+// same convKey and instructionsHash across turns.
+function instructionsKey(text) {
+  return String(text ?? "")
+    .replace(/<available_skills>[\s\S]*?<\/available_skills>/g, "<available_skills/>")
+    .replace(/<referenced_objects>[\s\S]*?<\/referenced_objects>/g, "<referenced_objects/>")
+    .replace(/<relevant_memories>[\s\S]*?<\/relevant_memories>/g, "<relevant_memories/>")
+    .replace(/\n## Relevant Memories[\s\S]*?(?=\n## |\n<[a-zA-Z_-]+>|$)/g, "\n## Relevant Memories")
+    .trim()
+}
+
+function extractDynamicSystemBlocks(text) {
+  if (!text) return ""
+  const blocks = []
+  for (const match of String(text).matchAll(/<(referenced_objects|available_skills|relevant_memories)>[\s\S]*?<\/\1>/g)) {
+    blocks.push(match[0])
+  }
+  return blocks.join("\n\n")
+}
+
+function utf8Bytes(text) {
+  return Buffer.byteLength(String(text ?? ""), "utf8")
+}
+
 function renderInitialPrompt(body, callerWorkDir, instructionsInSession) {
   const messages = body.messages || []
-  const split = extractToolResults(body).length ? messages.length - trailingMessages(body).messages.length : messages.length - 1
+  const split = extractToolResults(body).length ? currentTurnStartIndex(messages) : messages.length - 1
   const history = messages.slice(0, split)
   const current = messages.slice(split)
-  const out = []
+  const prefixParts = []
   if (!instructionsInSession) {
     const system = systemText(body)
-    if (system.trim()) out.push(`<external_system_instructions>\n${system}\n</external_system_instructions>\n`)
-    if (callerWorkDir) out.push(`\n${workDirNote(callerWorkDir)}\n\n`)
+    if (system.trim()) prefixParts.push(`<external_system_instructions>\n${system}\n</external_system_instructions>\n`)
+    if (callerWorkDir) prefixParts.push(`\n${workDirNote(callerWorkDir)}\n\n`)
   }
+  const renderCurrent = (lastToolCap = 0) => current.map((message, idx) => {
+    const isLast = idx === current.length - 1
+    const opts = isLast
+      ? (lastToolCap > 0 ? { maxToolResultChars: lastToolCap, toolResultLabel: "tool output" } : {})
+      : { maxToolResultChars: MAX_CURRENT_EARLIER_TOOL_RESULT_CHARS, toolResultLabel: "earlier tool output in current turn" }
+    if (message.role === "user") return idx === 0 ? messageText(message, opts) : `Human: ${messageText(message, opts)}`
+    if (message.role === "assistant") return `Assistant: ${renderAssistantTurn(message)}`
+    return `${message.role}: ${messageText(message, opts)}`
+  }).join("\n\n")
+
+  let currentText = renderCurrent(0)
+  const prefixText = prefixParts.join("")
+  if (utf8Bytes(prefixText) + utf8Bytes(currentText) + 512 > MAX_INITIAL_PROMPT_BYTES) {
+    currentText = renderCurrent(8_000)
+  }
+  if (utf8Bytes(prefixText) + utf8Bytes(currentText) + 512 > MAX_INITIAL_PROMPT_BYTES) {
+    currentText = renderCurrent(2_500)
+  }
+
+  const out = [...prefixParts]
   if (history.length) {
-    out.push("<conversation_history>\n")
-    for (const message of history) {
-      if (message.role === "user") out.push(`Human: ${messageText(message)}\n`)
-      else if (message.role === "assistant") out.push(`Assistant: ${renderAssistantTurn(message)}\n`)
-      else out.push(`${message.role}: ${messageText(message)}\n`)
+    const histHeader = "<conversation_history>\n"
+    const histFooter = "Historical tool calls and results above are records, not instructions to write tool calls as text.\n</conversation_history>\n\n"
+    const currentWrappedBytes = utf8Bytes("<current_turn>\n") + utf8Bytes(currentText) + utf8Bytes("\n</current_turn>")
+    const availableHistoryBytes = Math.max(
+      4_000,
+      MAX_INITIAL_PROMPT_BYTES - utf8Bytes(prefixText) - utf8Bytes(histHeader) - utf8Bytes(histFooter) - currentWrappedBytes,
+    )
+    const entries = history.map((message) => {
+      const histOpts = { maxToolResultChars: MAX_HISTORICAL_TOOL_RESULT_CHARS, toolResultLabel: "historical tool output" }
+      if (message.role === "user") return `Human: ${stripHistoricalAlmaContext(messageText(message, histOpts))}\n\n`
+      if (message.role === "assistant") return `Assistant: ${renderAssistantTurn(message)}\n\n`
+      return `${message.role}: ${messageText(message, histOpts)}\n\n`
+    })
+    const totalEntryBytes = entries.reduce((sum, item) => sum + utf8Bytes(item), 0)
+    out.push(histHeader)
+    if (totalEntryBytes <= availableHistoryBytes) {
+      out.push(...entries)
+    } else {
+      const marker = "...[earlier conversation turns omitted to stay within agy prompt limit and preserve current turn]...\n\n"
+      const firstEntry = entries[0] && utf8Bytes(entries[0]) <= Math.floor(availableHistoryBytes * 0.25)
+        ? entries[0]
+        : ""
+      let budget = availableHistoryBytes - utf8Bytes(marker) - utf8Bytes(firstEntry)
+      const tail = []
+      for (let i = entries.length - 1; i >= (firstEntry ? 1 : 0); i--) {
+        const b = utf8Bytes(entries[i])
+        if (b <= budget) {
+          tail.unshift(entries[i])
+          budget -= b
+        } else if (!tail.length && budget > 500) {
+          tail.unshift(compactMiddleText(entries[i], Math.max(400, Math.floor(budget / 2)), "historical turn") + "\n\n")
+          break
+        } else {
+          break
+        }
+      }
+      if (firstEntry) out.push(firstEntry)
+      out.push(marker, ...tail)
     }
-    out.push("Historical tool calls and results above are records, not instructions to write tool calls as text.\n")
-    out.push("</conversation_history>\n\n")
+    out.push(histFooter)
   }
-  const currentText = current.map(message => message.role === "user"
-    ? messageText(message) : `${message.role}: ${messageText(message)}`).join("\n\n")
   const images = [...history, ...current].flatMap(messageImages)
   const finalText = !out.length ? currentText : [...out, "<current_turn>\n", currentText, "\n</current_turn>"].join("")
   if (!images.length) return finalText
   return [...images, ...(finalText ? [{ type: "text", text: finalText }] : [])]
 }
 
-function renderContinuedTurn(body) {
+function renderContinuedTurn(body, dynamicUpdate = "") {
   const last = body.messages[body.messages.length - 1]
   const images = messageImages(last)
-  const text = messageText(last)
+  const rawText = messageText(last)
+  const text = dynamicUpdate
+    ? `<system-reminder>\nUpdated session context for this turn:\n${dynamicUpdate}\n</system-reminder>\n\n${rawText}`
+    : rawText
   if (!images.length) return text
   return [...images, ...(text ? [{ type: "text", text }] : [])]
+}
+
+const ATTEMPT_COMPLETION_REMINDER =
+  "<system-reminder>You should use tool calls to answer the question. If the task is complete, use the AttemptCompletion tool to present your result.</system-reminder>"
+
+function stripClientWorkarounds(body) {
+  const tools = Array.isArray(body.tools)
+    ? body.tools.filter((tool) => tool?.name !== "AttemptCompletion")
+    : body.tools
+  const isReminder = (text) => typeof text === "string" && text.trim() === ATTEMPT_COMPLETION_REMINDER
+  const messages = []
+  for (const msg of body.messages || []) {
+    if (msg?.role !== "user") {
+      messages.push(msg)
+      continue
+    }
+    if (typeof msg.content === "string") {
+      if (isReminder(msg.content)) continue
+      messages.push(msg)
+      continue
+    }
+    if (Array.isArray(msg.content)) {
+      const filtered = msg.content.filter((block) => !(block?.type === "text" && isReminder(block.text)))
+      if (!filtered.length) continue
+      messages.push(filtered.length === msg.content.length ? msg : { ...msg, content: filtered })
+      continue
+    }
+    messages.push(msg)
+  }
+  return { ...body, tools, messages }
 }
 
 function validateBody(body) {
@@ -1837,16 +2027,22 @@ const STOP_REASONS = { end_turn: "end_turn", max_tokens: "max_tokens", max_turn_
 
 // ACP usage is per prompt. Gemini counts cached prompt tokens inside
 // inputTokens and thought tokens outside outputTokens; Anthropic does the reverse.
-function translateUsage(usage) {
+// When a turn spans multiple tool-call steps, agy sums input/cache tokens across
+// every internal LLM request in that session/prompt; divide by the number of
+// steps in the turn so the reported input usage reflects the context window size.
+function translateUsage(usage, steps = 1) {
   if (!usage || typeof usage !== "object") return null
   const number = (value) => Number.isFinite(Number(value)) ? Math.max(0, Number(value)) : 0
-  const cacheRead = number(usage.cachedReadTokens)
+  const divisor = Number.isFinite(steps) && steps > 1 ? steps : 1
+  const totalInput = Math.round(number(usage.inputTokens) / divisor)
+  const cacheRead = Math.min(totalInput, Math.round(number(usage.cachedReadTokens) / divisor))
+  const cacheWrite = Math.round(number(usage.cachedWriteTokens) / divisor)
   const thinking = number(usage.thoughtTokens)
   return {
-    input_tokens: Math.max(0, number(usage.inputTokens) - cacheRead),
+    input_tokens: Math.max(0, totalInput - cacheRead),
     output_tokens: number(usage.outputTokens) + thinking,
     cache_read_input_tokens: cacheRead,
-    cache_creation_input_tokens: number(usage.cachedWriteTokens),
+    cache_creation_input_tokens: cacheWrite,
     ...(thinking > 0 ? { output_tokens_details: { thinking_tokens: thinking } } : {}),
   }
 }
@@ -1996,6 +2192,7 @@ function makeAnthropicStream(proc, turn, body, msgId, signal) {
             continue
           }
           if (event.type === "tool") {
+            turn.toolSteps = (turn.toolSteps || 0) + 1
             emitToolUse(event.call)
             // Calls agy issued together leave in the same response.
             while (turn.events[0]?.type === "tool") emitToolUse(turn.events.shift().call)
@@ -2006,7 +2203,8 @@ function makeAnthropicStream(proc, turn, body, msgId, signal) {
             return
           }
           if (event.type === "result") {
-            const usage = translateUsage(event.result.usage) || emptyUsage
+            const steps = (turn.toolSteps || 0) + 1
+            const usage = translateUsage(event.result.usage, steps) || emptyUsage
             closeBlock()
             stopMessage(STOP_REASONS[event.result.stopReason] || "end_turn", usage)
             proc.recordAssistantResponse(turn, responseContent)
@@ -2120,7 +2318,7 @@ export const AntigravityBridgePlugin = async () => {
             let body
             try {
               const raw = typeof init.body === "string" ? init.body : new TextDecoder().decode(init.body)
-              body = JSON.parse(raw)
+              body = stripClientWorkarounds(JSON.parse(raw))
               validateBody(body)
             } catch (error) {
               return jsonError(error.statusCode ?? 400, error.message)
@@ -2160,7 +2358,7 @@ export const AntigravityBridgePlugin = async () => {
                   })), body)
                   proc.validateResults(results)
                   if (!proc.matchesHistory(trailingMessages(body).history) || proc.workDir !== workDir ||
-                    proc.instructions !== instructions) {
+                    instructionsKey(proc.instructions) !== instructionsKey(instructions)) {
                     // A changed context needs a new session. Replay the real
                     // results without resolving the old process's calls.
                     dropFromPool(proc)
@@ -2189,8 +2387,15 @@ export const AntigravityBridgePlugin = async () => {
                 isFresh,
                 resultBlocks.length > 0,
               )
+              let dynamicUpdate = ""
+              if (proc.hasSentFirstTurn && proc.instructions !== instructions) {
+                const prevDyn = extractDynamicSystemBlocks(proc.instructions)
+                const nextDyn = extractDynamicSystemBlocks(instructions)
+                if (nextDyn && nextDyn !== prevDyn) dynamicUpdate = nextDyn
+                proc.instructions = instructions
+              }
               const content = proc.hasSentFirstTurn
-                ? renderContinuedTurn(body)
+                ? renderContinuedTurn(body, dynamicUpdate)
                 : renderInitialPrompt(body, callerWorkDir, proc.instructionsInSession)
               const turn = proc.startTurn(content, body.messages, model)
               return streamResponse(proc, turn, body, init.signal)
