@@ -134,7 +134,7 @@ function finish(reply, extra = {}) {
   log({ type: "result", convId: session.id, prompt: session.prompts, response: reply })
   return {
     stopReason: "end_turn",
-    usage: { inputTokens: 10 + (extra.cached || 0), outputTokens: reply.length, cachedReadTokens: extra.cached || 0, cachedWriteTokens: 0, thoughtTokens: extra.thought || 0, totalTokens: 10 + reply.length },
+    usage: { inputTokens: 10, outputTokens: reply.length, cachedReadTokens: extra.cached || 0, cachedWriteTokens: 0, thoughtTokens: extra.thought || 0, totalTokens: 10 + (extra.cached || 0) + reply.length },
   }
 }
 

@@ -2883,21 +2883,22 @@ function sseEvent(event, data) {
 
 const STOP_REASONS = { end_turn: "end_turn", max_tokens: "max_tokens", max_turn_requests: "end_turn", refusal: "refusal" }
 
-// ACP usage is per prompt. Gemini counts cached prompt tokens inside
-// inputTokens and thought tokens outside outputTokens; Anthropic does the reverse.
-// When a turn spans multiple tool-call steps, agy sums input/cache tokens across
-// every internal LLM request in that session/prompt; divide by the number of
-// steps in the turn so the reported input usage reflects the context window size.
+// ACP usage is per prompt. agy reports uncached prompt tokens in inputTokens
+// (gen_metadata 1.4.2) and cached prompt tokens separately in cachedReadTokens
+// (gen_metadata 1.4.5). When a turn spans multiple tool-call steps, agy sums
+// input/cache tokens across every internal LLM request in that session/prompt;
+// divide by the number of steps in the turn so the reported input usage
+// reflects the per-step context window size.
 function translateUsage(usage, steps = 1) {
   if (!usage || typeof usage !== "object") return null
   const number = (value) => Number.isFinite(Number(value)) ? Math.max(0, Number(value)) : 0
   const divisor = Number.isFinite(steps) && steps > 1 ? steps : 1
-  const totalInput = Math.round(number(usage.inputTokens) / divisor)
-  const cacheRead = Math.min(totalInput, Math.round(number(usage.cachedReadTokens) / divisor))
+  const input = Math.round(number(usage.inputTokens) / divisor)
+  const cacheRead = Math.round(number(usage.cachedReadTokens) / divisor)
   const cacheWrite = Math.round(number(usage.cachedWriteTokens) / divisor)
   const thinking = number(usage.thoughtTokens)
   return {
-    input_tokens: Math.max(0, totalInput - cacheRead),
+    input_tokens: input,
     output_tokens: number(usage.outputTokens) + thinking,
     cache_read_input_tokens: cacheRead,
     cache_creation_input_tokens: cacheWrite,
