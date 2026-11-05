@@ -3566,7 +3566,7 @@ export const AntigravityBridgePlugin = async () => {
                 error: `agy at ${agy} is not signed in (${why}). Run \`agy\` in a terminal once to sign in to your Google account, then try again.`,
               }
             }
-            return { type: "success", key: "agy", ...(email ? { accountId: email } : {}) }
+            return { type: "success", key: "agy", ...(email ? { accountId: email, metadata: { email } } : {}) }
           },
         },
       ],
