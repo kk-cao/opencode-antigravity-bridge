@@ -42,6 +42,21 @@ test("a companion cannot attach to a different preceding tool", () => {
   }
 })
 
+test("Codex context notices keep live session and merged user text sets userSteered", () => {
+  const patch = result("call_patch", "apply_patch", "Success. Updated files")
+  const timeTag = "<codex_apps_client_time_context><timezone>Asia/Taipei</timezone>\n<current_date>2026-11-05</current_date></codex_apps_client_time_context>"
+  const collabTag = "<collaboration_mode># Collaboration Mode: Default\nChanges with `<collaboration_mode>...</collaboration_mode>`.</collaboration_mode>"
+  const noticeOnly = inspectToolTurn([patch], bodyFor([patch.block, { type: "text", text: timeTag }, { type: "text", text: collabTag }]))
+  assert.equal(noticeOnly.userSteered, false)
+  assert.ok(noticeOnly.results[0].result.content.at(-1).text.includes("<codex_apps_client_time_context>"))
+  const steered = inspectToolTurn([patch], bodyFor([
+    patch.block,
+    { type: "text", text: timeTag },
+    { type: "text", text: "可以升级 重启没关系\nCVE-2026-98432 这个是不是都升级好了\n" },
+  ]))
+  assert.equal(steered.userSteered, true)
+})
+
 test("a partial ID rename maps by full history without discarding the live ID anchor", () => {
   const original = [
     { type: "tool_use", id: "original_a", name: "Read", input: { path: "a" } },

@@ -1921,14 +1921,16 @@ for (const location of ["inline", "system", "developer", "user"]) {
   const skillTool = { name: 'Skill', description: 'Skill', input_schema: { type: 'object' } }
   const first = { model, messages: [{ role: 'user', content: 'SKILLCALL ordinary user steering regression' }], tools: [skillTool] }
   const events = (await readSSE(await callFetch(first))).events
+  const oldId = inits().at(-1).convId
   const second = continuation(first, events, 'Launching skill: archive')
   second.messages.at(-1).content.push({ type: 'text', text: 'Stop this task and explain something else' })
   const response = await callFetch(second)
-  check('plain user instructions are not treated as a Skill prompt body', response.status === 400, `got ${response.status}`)
-  if (response.status === 400) {
-    await response.text()
-    await drive(first, events, 'cleanup ordinary Skill text')
-  } else await readSSE(response)
+  await readSSE(response)
+  const delivered = logs().filter(event => event.type === 'mcpResult' && event.convId === oldId)
+  check('plain user instructions are not treated as a Skill prompt body',
+    response.status === 200 && delivered.length === 0 &&
+    lastOf('user').convId !== oldId && lastOf('user').text.includes('Stop this task and explain something else'),
+    `got ${response.status}`)
 }
 
 {

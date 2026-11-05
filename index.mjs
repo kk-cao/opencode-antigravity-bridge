@@ -2590,7 +2590,7 @@ function isInterruptedToolTurn(body) {
       const text = stripMagpiePlaceholderNotice(blockText(block))
       if (!seenResult && message.role === "user" && text.trim()) return false
       if (seenResult && message.role === "user" &&
-        /^\[Request interrupted by user(?:\s+for tool use)?\]\s*$/.test(text)) {
+        /^(?:\[Request interrupted by user(?:\s+for tool use)?\]|<turn_aborted>[\s\S]*<\/turn_aborted>)\s*$/.test(text)) {
         return true
       }
     }
@@ -2603,6 +2603,7 @@ const CONTEXT_NOTICE_RE = new RegExp(
   `<(${NOTICE_TAG_NAMES})(?:\\s[^>]*)?>[\\s\\S]*?<\\/\\1>|(?:\\[(?:SYSTEM NOTIFICATION|MESSAGE FROM NON-USER SOURCE) - NOT USER INPUT\\][^<]*)?<task-notification>[\\s\\S]*?<\\/task-notification>`,
   "g",
 )
+const CODEX_CONTEXT_RE = /<(?:codex_apps_client_time_context|external_codex_apps_open_page|codex_apps_open_page_instructions|environment_context|app-context|model_switch|subagent_notification|permissions instructions)(?:\s[^>]*)?>[\s\S]*?<\/(?:codex_apps_client_time_context|external_codex_apps_open_page|codex_apps_open_page_instructions|environment_context|app-context|model_switch|subagent_notification|permissions instructions)>|<collaboration_mode(?:\s[^>]*)?>[\s\S]*<\/collaboration_mode>/g
 const SYSTEM_REMINDER_RE = /<system-reminder(?:\s[^>]*)?>([\s\S]*?)<\/system-reminder(?:\s[^>]*)?>/g
 const PROTOCOL_NOTICE_START_RE = new RegExp(
   `^(?:<(?:${NOTICE_TAG_NAMES}|task-notification|system-reminder)\\b|\\[(?:SYSTEM NOTIFICATION|MESSAGE FROM NON-USER SOURCE) - NOT USER INPUT\\])`,
@@ -2613,9 +2614,9 @@ const UNCLOSED_NOTICE_RE = new RegExp(
 
 // Forward complete protocol-generated context notices, Claude Code hook outputs,
 // and tool-companion blocks without turning arbitrary inline user instructions
-// into MCP function_response text. Mid-turn queued_command prompts and follow-up
-// user instructions after a rejected/stopped tool call set userSteered so the
-// bridge replays them via session/prompt.
+// into MCP function_response text. Mid-turn queued_command prompts, Codex/Magpie
+// merged user messages, and follow-up user instructions after a tool call set
+// userSteered so the bridge replays them via session/prompt.
 function inspectToolTurn(results, body) {
   let out = results
   let userSteered = false
@@ -2652,8 +2653,14 @@ function inspectToolTurn(results, body) {
         continue
       }
       const rawText = blockText(block)
-      if (!seenResult && message.role === "user" && rawText.trim()) {
-        throw new UnsupportedContent("text beside a live tool_result; send it after the tool response completes")
+      if (!seenResult && message.role === "user") {
+        const preCodex = Array.from(rawText.matchAll(CODEX_CONTEXT_RE), (match) => match[0])
+        const preRest = stripMagpiePlaceholderNotice(rawText).replace(CODEX_CONTEXT_RE, "").trim()
+        if (preRest) {
+          throw new UnsupportedContent("text beside a live tool_result; send it after the tool response completes")
+        }
+        if (preCodex.length) notices.push(...preCodex)
+        continue
       }
       const text = stripMagpiePlaceholderNotice(rawText)
       if (text !== rawText && !notices.includes(MAGPIE_PLACEHOLDER_NOTICE)) {
@@ -2675,7 +2682,7 @@ function inspectToolTurn(results, body) {
           continue
         }
         if (nonUserSourceNotice.test(trimmed) && !/<task-notification\b/.test(trimmed)) {
-          const check = trimmed.replace(CONTEXT_NOTICE_RE, "").replace(SYSTEM_REMINDER_RE, "")
+          const check = trimmed.replace(CONTEXT_NOTICE_RE, "").replace(CODEX_CONTEXT_RE, "").replace(SYSTEM_REMINDER_RE, "")
           if (UNCLOSED_NOTICE_RE.test(check)) {
             throw new UnsupportedContent("text beside a live tool_result; send it after the tool response completes")
           }
@@ -2701,9 +2708,12 @@ function inspectToolTurn(results, body) {
           continue
         }
       }
+      const hasStrictNotice = /<(?:system-update|task-notification)\b/.test(text)
       notices.push(...Array.from(text.matchAll(CONTEXT_NOTICE_RE), (match) => match[0]))
-      const withoutNotices = text.replace(CONTEXT_NOTICE_RE, "")
-      for (const match of withoutNotices.matchAll(SYSTEM_REMINDER_RE)) {
+      notices.push(...Array.from(text.matchAll(CODEX_CONTEXT_RE), (match) => match[0]))
+      const withoutNotices = text.replace(CONTEXT_NOTICE_RE, "").replace(CODEX_CONTEXT_RE, "")
+      const matchedReminders = Array.from(withoutNotices.matchAll(SYSTEM_REMINDER_RE))
+      for (const match of matchedReminders) {
         const inner = match[1].trim()
         if (extractQueuedPrompt(inner) !== null || userInterruption.test(inner)) {
           userSteered = true
@@ -2724,7 +2734,8 @@ function inspectToolTurn(results, body) {
       } else if (!isNoise(rest)) {
         if ((hookOutput.test(rest) || claudeMetaFeedback.test(rest)) && !userInterruption.test(rest)) {
           notices.push(rest)
-        } else if (userSteered || stoppedByHookOrUser || notices.some((item) => hookStoppedContinuation.test(item))) {
+        } else if (userSteered || stoppedByHookOrUser || notices.some((item) => hookStoppedContinuation.test(item)) ||
+          (!hasStrictNotice && !matchedReminders.length && !hookOutput.test(rest))) {
           userSteered = true
         } else {
           throw new UnsupportedContent("text beside a live tool_result; send it after the tool response completes")
@@ -2756,16 +2767,37 @@ function canReplayFollowUpAfterResults(body, rawResults) {
       lastResultIndex = i
     }
   }
-  if (lastResultIndex < 0 || lastResultIndex >= messages.length - 1) return false
+  if (lastResultIndex < 0) return false
+  const resultMsg = messages[lastResultIndex]
+  const blocks = Array.isArray(resultMsg.content) ? resultMsg.content : []
+  let lastToolBlockIdx = -1
+  for (let j = 0; j < blocks.length; j++) {
+    if (blocks[j]?.type === "tool_result") lastToolBlockIdx = j
+  }
+  const trailingBlocksInResultMsg = lastToolBlockIdx >= 0 ? blocks.slice(lastToolBlockIdx + 1) : []
+  const hasMergedFollowUp = trailingBlocksInResultMsg.some((block) =>
+    block?.type === "text" && typeof block.text === "string" && block.text.trim() &&
+    !PROTOCOL_NOTICE_START_RE.test(block.text.trim()) && !UNCLOSED_NOTICE_RE.test(block.text.trim()) &&
+    !/^(?:\s*(?:Base directory for this skill:|ARGUMENTS:|Skill arguments:) |Tools? loaded\.|\[Image(?: source)?: )/.test(block.text.trim()))
   const tail = messages.slice(lastResultIndex + 1)
-  if (!tail.some((message) => message.role === "user")) return false
+  if (!hasMergedFollowUp && !tail.some((message) => message.role === "user")) return false
   try {
-    withContextNotices(rawResults, { ...body, messages: [...history, ...messages.slice(0, lastResultIndex + 1)] })
+    const trimmedResultMsg = hasMergedFollowUp
+      ? { ...resultMsg, content: blocks.slice(0, lastToolBlockIdx + 1) }
+      : resultMsg
+    withContextNotices(rawResults, {
+      ...body,
+      messages: [...history, ...messages.slice(0, lastResultIndex), trimmedResultMsg],
+    })
   } catch {
     return false
   }
+  for (const block of trailingBlocksInResultMsg) {
+    const rest = blockText(block).replace(CONTEXT_NOTICE_RE, "").replace(CODEX_CONTEXT_RE, "").replace(SYSTEM_REMINDER_RE, "")
+    if (UNCLOSED_NOTICE_RE.test(rest)) return false
+  }
   for (const message of tail) {
-    const rest = messageText(message).replace(CONTEXT_NOTICE_RE, "").replace(SYSTEM_REMINDER_RE, "")
+    const rest = messageText(message).replace(CONTEXT_NOTICE_RE, "").replace(CODEX_CONTEXT_RE, "").replace(SYSTEM_REMINDER_RE, "")
     if (UNCLOSED_NOTICE_RE.test(rest)) return false
   }
   return true
