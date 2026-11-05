@@ -29,6 +29,8 @@ function ideCallDeadline() {
   return positiveTimeout(process.env.AGY_BRIDGE_IDE_CALL_DEADLINE_MS, 150_000)
 }
 const CANCEL_SETTLE_MS = 15_000
+const SELF_POLL_LIMIT = positiveTimeout(process.env.AGY_BRIDGE_SELF_POLL_LIMIT, 8)
+const SELF_POLL_NOTE = "agy bridge: gave up waiting for this tool: the client never returned a result for it; stop this turn"
 const TOOL_LIST_WAIT_MS = 5_000
 const STDERR_TAIL = 32 * 1024
 const CONTROL_LINE_LIMIT = 16 * 1024 * 1024
@@ -1253,6 +1255,7 @@ class Proc {
       deferred: false,
       lateDelivered: false,
       deadline: null,
+      stillRunning: 0,
     }
     turn.flushText()
     turn.calls.push(call)
@@ -1275,10 +1278,12 @@ class Proc {
   async #deferCall(turn, call) {
     if (call.mcpResponded || call.result || turn.done || turn.finalized) return
     call.deferred = true
+    call.stillRunning++
     this.#respondMcp(call, { result: { content: [{ type: "text", text: stillRunningText(call) }], isError: false } })
   }
 
-  // A repeat of a still-running call waits for the original instead of running again.
+  // A repeat of a still-running call waits for the original instead of running again,
+  // without resetting the client's inactivity timer.
   #acceptWait(turn, target, socket) {
     const reply = (result) => {
       try { socket.end(JSON.stringify({ result }) + "\n") } catch {}
@@ -1288,9 +1293,15 @@ class Proc {
       reply(target.result)
       return null
     }
+    if (!turn.attached && target.stillRunning >= SELF_POLL_LIMIT) {
+      reply({ content: [{ type: "text", text: SELF_POLL_NOTE }], isError: true })
+      this.timeoutTurn(turn, new Error(SELF_POLL_NOTE))
+      return null
+    }
     const waiter = { socket, target, reply, timer: null }
     waiter.timer = setTimeout(() => {
       turn.awaitCalls = turn.awaitCalls.filter((item) => item !== waiter)
+      target.stillRunning++
       reply({ content: [{ type: "text", text: stillRunningText(target) }], isError: false })
     }, ideCallDeadline())
     waiter.timer.unref?.()
@@ -1299,7 +1310,6 @@ class Proc {
       clearTimeout(waiter.timer)
       turn.awaitCalls = turn.awaitCalls.filter((item) => item !== waiter)
     })
-    turn.arm()
     return null
   }
 
