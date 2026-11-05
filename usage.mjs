@@ -47,7 +47,7 @@ function cadence(bucket, id, name) {
 
 // agy's command report is not its token-usage object or a model-availability list.
 // Unknown quota is not evidence of exhaustion or a full allowance.
-export function parseUsageReport(value) {
+export function parseUsageReport(value, { email, plan } = {}) {
   let report
   try { report = typeof value === "string" ? JSON.parse(value) : value } catch {
     throw new UsageError("agy returned an invalid usage report.")
@@ -57,7 +57,7 @@ export function parseUsageReport(value) {
   }
   const groups = report.command.data?.groups
   const windows = []
-  for (const group of Array.isArray(groups) ? groups : []) {
+  for (const [groupIndex, group] of (Array.isArray(groups) ? groups : []).entries()) {
     const pool = (text(field(group, "displayName", "display_name")) || text(group?.name) || "Quota")
       .replace(/\s+models$/i, "").replace(/\s+and\s+/gi, " & ")
     for (const bucket of Array.isArray(group?.buckets) ? group.buckets : []) {
@@ -70,12 +70,15 @@ export function parseUsageReport(value) {
         ?? field(remaining, "remainingFraction", "remaining_fraction")
         ?? (remaining?.case === "remainingFraction" ? remaining.value : undefined)
       const known = typeof fraction === "number" && Number.isFinite(fraction) && fraction >= 0 && fraction <= 1
+      const used = known ? Math.round((1 - fraction) * 1e8) / 1e6 : undefined
       const resetsAt = resetTime(field(bucket, "resetTime", "reset_time"))
+      // Primary group windows (when not exhausted) stay visible on Magpie's account summary card;
+      // secondary or exhausted pools are marked aside so one exhausted pool does not block routing.
+      const aside = groupIndex > 0 || !known || used >= 100
       windows.push({
         name: `${pool} · ${period.name}`,
-        // This feature displays quota only; it must not change model routing.
-        aside: true,
-        ...(known ? { used: Math.round((1 - fraction) * 1e8) / 1e6 } : { display: "Limits not available" }),
+        ...(aside ? { aside: true } : {}),
+        ...(known ? { used } : { display: "Limits not available" }),
         ...(period.span ? { span: period.span } : {}),
         ...(resetsAt ? { resetsAt } : {}),
       })
@@ -84,8 +87,12 @@ export function parseUsageReport(value) {
   if (!windows.some(w => w.used !== undefined)) {
     throw new UsageError("Limits not available: agy returned no enabled, measured quota buckets.")
   }
-  // /usage has no verified account or plan identity. Do not borrow one elsewhere.
-  return { windows }
+  const out = { windows }
+  if (text(email)) {
+    out.user = text(email)
+    out.plan = text(plan) || "Google AI"
+  }
+  return out
 }
 
 function timeout(value) {
@@ -182,19 +189,23 @@ export async function fetchUsage(agy, {
     for (const name of ["open", "xdg-open"]) {
       await fs.writeFile(path.join(directory, name), "#!/bin/sh\nexit 1\n", { mode: 0o700 })
     }
+    const pathKey = Object.keys(env).find(k => k.toUpperCase() === "PATH") || "PATH"
     const childEnv = {
       ...env,
       AGY_CLI_DISABLE_AUTO_UPDATE: "true",
-      PATH: directory + path.delimiter + (env.PATH || "/usr/bin:/bin"),
+      [pathKey]: directory + path.delimiter + (env[pathKey] || env.PATH || env.Path || "/usr/bin:/bin"),
       BROWSER: path.join(directory, "open"),
     }
     const options = { cwd: directory, env: childEnv, deadline, signal, maxOutputBytes }
     const version = await run(agy, ["--version"], { ...options, deadline: Math.min(deadline, Date.now() + 3000) })
     if (version.code !== 0) throw commandFailure(version.stderr)
     if (!supportedVersion(version.stdout)) throw new UsageError("agy usage reports require a verified agy version 1.1.11 or later. Update the CLI.")
-    const result = await run(agy, ["-p", "/usage", "--output-format", "json", "--agent", "magpie-usage", "--print-timeout", `${Math.max(1, Math.ceil((deadline - Date.now()) / 1000))}s`], options)
+    const logFile = path.join(directory, "usage.log")
+    const result = await run(agy, ["-p", "/usage", "--output-format", "json", "--agent", "magpie-usage", "--print-timeout", `${Math.max(1, Math.ceil((deadline - Date.now()) / 1000))}s`, "--log-file", logFile], options)
     if (result.code !== 0) throw commandFailure(result.stderr + "\n" + result.stdout)
-    return parseUsageReport(result.stdout)
+    const logText = await fs.readFile(logFile, "utf8").catch(() => "")
+    const emailMatch = /(?:OAuth:\s*authenticated successfully as\s+|applyAuthResult:\s*email=)([^\s,;]+)/i.exec(logText)
+    return parseUsageReport(result.stdout, { email: emailMatch?.[1] })
   } finally {
     await fs.rm(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 }).catch(() => {})
   }

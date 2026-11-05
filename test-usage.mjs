@@ -10,7 +10,7 @@ const report = groups => ({ status: "SUCCESS", command: { name: "usage", data: {
 const group = (buckets, name = "Gemini Models") => ({ name, buckets })
 const bucket = (overrides = {}) => ({ id: "gemini-5h", name: "Five Hour Limit Remaining", window: "5h", remaining_fraction: 0.75, ...overrides })
 
-test("maps all groups/cadences to display-only Magpie windows, without invented identity", () => {
+test("maps primary non-exhausted windows to main Magpie quota and secondary/exhausted windows to aside", () => {
   const result = parseUsageReport(report([
     group([bucket(), bucket({ id: "gemini-weekly", window: "weekly", remaining_fraction: 0.5 })]),
     group([bucket({ id: "3p-5h", remaining_fraction: 0 }), bucket({ id: "3p-weekly", window: "weekly", remaining_fraction: 1 })], "Claude and GPT models"),
@@ -20,9 +20,13 @@ test("maps all groups/cadences to display-only Magpie windows, without invented 
   assert.deepEqual(result.windows.map(w => w.name), ["Gemini · 5 hours", "Gemini · 7 days", "Claude & GPT · 5 hours", "Claude & GPT · 7 days", "Gemini 4 Argon · 7 days"])
   assert.deepEqual(result.windows.map(w => w.used), [25, 50, 100, 0, 47])
   assert.deepEqual(result.windows.map(w => w.span), [18000, 604800, 18000, 604800, 604800])
-  assert.ok(result.windows.every(w => w.aside === true))
+  assert.deepEqual(result.windows.map(w => Boolean(w.aside)), [false, false, true, true, true])
   assert.equal(result.plan, undefined)
   assert.equal(result.user, undefined)
+
+  const withIdentity = parseUsageReport(report([group([bucket()])]), { email: "user@example.com" })
+  assert.equal(withIdentity.user, "user@example.com")
+  assert.equal(withIdentity.plan, "Google AI")
 })
 
 test("accepts camel case and nested/oneof fractions plus ISO and epoch-second resets", () => {

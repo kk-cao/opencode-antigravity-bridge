@@ -675,6 +675,7 @@ class Proc {
     this.turn = null
     this.expectedMessages = null
     this.expectedHistoryKey = null
+    this.lastTranscriptStepIndex = -1
     this.toolsVersion = 1
     this.listedVersion = 0
     this.listWaiters = []
@@ -686,6 +687,8 @@ class Proc {
   async start() {
     await ensureControlServer()
     const bin = await ensureShimDir()
+    const geminiDir = bridgeGeminiDir()
+    await fs.promises.mkdir(geminiDir, { recursive: true }).catch(() => {})
     sessions.set(this.token, this)
     this.workspace = await fs.promises.mkdtemp(path.join(os.tmpdir(), "magpie-agy-bridge-"))
     const agentDir = path.join(this.workspace, ".agents", "agents", AGENT_NAME)
@@ -696,6 +699,8 @@ class Proc {
     const args = [
       "acp",
       "--agent", AGENT_NAME,
+      "--gemini-dir", geminiDir,
+      "--include-default-customizations=false",
       "--log-file", this.logPath,
       "--ide-mcp-port", String(controlServer.address().port),
     ]
@@ -1402,6 +1407,9 @@ class Proc {
         }
       }
     }
+    if (this.sessionId && parked.get(this.convKey)?.sessionId !== this.sessionId) {
+      cleanupSessionData(this.sessionId)
+    }
     allProcs.delete(this)
   }
 }
@@ -1536,6 +1544,17 @@ function imageDigest(data) {
   }
   imageDigestCache.set(key, value)
   return value
+}
+
+function bridgeGeminiDir() {
+  return process.env.AGY_BRIDGE_GEMINI_DIR || path.join(os.tmpdir(), "magpie-agy-acp-state")
+}
+
+function cleanupSessionData(sessionId) {
+  if (!sessionId || /[\\/]/.test(sessionId)) return
+  const base = path.join(bridgeGeminiDir(), "antigravity-cli")
+  fs.promises.rm(path.join(base, "brain", sessionId), { recursive: true, force: true }).catch(() => {})
+  fs.promises.rm(path.join(base, "conversations", `${sessionId}.db`), { force: true }).catch(() => {})
 }
 
 // Resumable sessions survive a plugin or Magpie restart: agy keeps the
@@ -1682,7 +1701,12 @@ function park(proc) {
     workDir: proc.workDir,
     at: Date.now(),
   })
-  while (parked.size > MAX_PARKED) parked.delete(parked.keys().next().value)
+  while (parked.size > MAX_PARKED) {
+    const oldestKey = parked.keys().next().value
+    const oldest = parked.get(oldestKey)
+    parked.delete(oldestKey)
+    if (oldest?.sessionId) cleanupSessionData(oldest.sessionId)
+  }
   saveParked()
 }
 
@@ -3072,6 +3096,50 @@ function thinkingSignature(sessionId, thinking) {
     createHmac("sha256", THINKING_KEY).update(String(sessionId) + "\n" + thinking).digest("base64url")
 }
 
+function readStepTranscriptUsage(proc) {
+  if (!proc?.sessionId) return null
+  const transcriptPath = path.join(
+    bridgeGeminiDir(),
+    "antigravity-cli",
+    "brain",
+    proc.sessionId,
+    ".system_generated",
+    "logs",
+    "transcript.jsonl",
+  )
+  let raw
+  try {
+    raw = fs.readFileSync(transcriptPath, "utf8")
+  } catch {
+    return null
+  }
+  const lines = raw.trim().split("\n")
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (!lines[i].includes('"PLANNER_RESPONSE"')) continue
+    try {
+      const entry = JSON.parse(lines[i])
+      if (entry?.type !== "PLANNER_RESPONSE") continue
+      if (typeof entry.step_index === "number" && entry.step_index <= (proc.lastTranscriptStepIndex ?? -1)) {
+        return null
+      }
+      const input = Number(entry.input_tokens)
+      const cacheRead = Number(entry.cache_read_tokens)
+      const output = Number(entry.output_tokens)
+      if (!Number.isFinite(input) && !Number.isFinite(output)) return null
+      if (typeof entry.step_index === "number") {
+        proc.lastTranscriptStepIndex = entry.step_index
+      }
+      return {
+        input_tokens: Math.max(0, Math.round(input || 0)),
+        output_tokens: Math.max(1, Math.round(output || 0)),
+        cache_read_input_tokens: Math.max(0, Math.round(cacheRead || 0)),
+        cache_creation_input_tokens: 0,
+      }
+    } catch {}
+  }
+  return null
+}
+
 function makeAnthropicStream(proc, turn, body, msgId, signal) {
   const encoder = new TextEncoder()
   const responseContent = []
@@ -3214,9 +3282,29 @@ function makeAnthropicStream(proc, turn, body, msgId, signal) {
                 : block.type === "thinking" ? block.thinking
                   : block.type === "tool_use" ? `${block.name} ${JSON.stringify(block.input ?? {})}` : "",
             ).join("\n")
+            const stepThinkingText = responseContent
+              .filter((block) => block.type === "thinking")
+              .map((block) => block.thinking || "")
+              .join("\n")
+            const stepThinkingTokens = stepThinkingText ? Math.max(1, estimateTextTokens(stepThinkingText)) : 0
             const stepOutputTokens = Math.max(1, estimateTextTokens(stepText))
-            turn.reportedOutputTokens = (turn.reportedOutputTokens || 0) + stepOutputTokens
-            stopMessage("tool_use", { input_tokens: 0, output_tokens: stepOutputTokens, cache_read_input_tokens: 0 })
+            const transcriptUsage = readStepTranscriptUsage(proc)
+            const reportedOut = transcriptUsage ? transcriptUsage.output_tokens : stepOutputTokens
+            turn.reportedOutputTokens = (turn.reportedOutputTokens || 0) + reportedOut
+            const toolStepUsage = transcriptUsage
+              ? {
+                input_tokens: transcriptUsage.input_tokens,
+                output_tokens: transcriptUsage.output_tokens + stepThinkingTokens,
+                cache_read_input_tokens: transcriptUsage.cache_read_input_tokens,
+                ...(stepThinkingTokens > 0 ? { output_tokens_details: { thinking_tokens: stepThinkingTokens } } : {}),
+              }
+              : {
+                input_tokens: estimateInputTokens(body),
+                output_tokens: stepOutputTokens,
+                cache_read_input_tokens: 0,
+                ...(stepThinkingTokens > 0 ? { output_tokens_details: { thinking_tokens: stepThinkingTokens } } : {}),
+              }
+            stopMessage("tool_use", toolStepUsage)
             proc.recordAssistantResponse(turn, responseContent)
             detach()
             controller.close()
@@ -3224,7 +3312,17 @@ function makeAnthropicStream(proc, turn, body, msgId, signal) {
           }
           if (event.type === "result") {
             const steps = (turn.toolSteps || 0) + 1
-            const usage = translateUsage(event.result.usage, steps, turn.reportedOutputTokens || 0) || emptyUsage
+            const baseUsage = translateUsage(event.result.usage, steps, turn.reportedOutputTokens || 0) || emptyUsage
+            const transcriptUsage = steps > 1 ? readStepTranscriptUsage(proc) : null
+            const thinking = baseUsage.output_tokens_details?.thinking_tokens || 0
+            const usage = transcriptUsage
+              ? {
+                ...baseUsage,
+                input_tokens: transcriptUsage.input_tokens,
+                cache_read_input_tokens: transcriptUsage.cache_read_input_tokens,
+                output_tokens: transcriptUsage.output_tokens + thinking,
+              }
+              : baseUsage
             closeBlock()
             stopMessage(STOP_REASONS[event.result.stopReason] || "end_turn", usage)
             proc.recordAssistantResponse(turn, responseContent)
@@ -3429,6 +3527,7 @@ export const AntigravityBridgePlugin = async () => {
     auth: {
       provider: PROVIDER_ID,
       single: true,
+      maxConcurrency: MAX_PROCS,
       // Magpie's usage hook; OpenCode ignores this extension. agy owns auth.
       usage: async () => readUsage(),
       methods: [
@@ -3444,7 +3543,20 @@ export const AntigravityBridgePlugin = async () => {
                 error: "agy CLI not found. Install Antigravity CLI first: https://antigravity.google/docs/cli — then run `agy` once to sign in.",
               }
             }
-            const probe = await execOnce(agy, ["models"], { timeoutMs: 15_000 })
+            const probeLog = path.join(os.tmpdir(), `magpie-agy-auth-${randomUUID().slice(0, 8)}.log`)
+            let probe
+            try {
+              probe = await execOnce(agy, ["models", "--log-file", probeLog], { timeoutMs: 15_000 })
+            } finally {
+              // Read log before cleanup below
+            }
+            let email = ""
+            try {
+              const logText = await fs.promises.readFile(probeLog, "utf8")
+              const match = /(?:OAuth:\s*authenticated successfully as\s+|applyAuthResult:\s*email=)([^\s,;]+)/i.exec(logText)
+              if (match?.[1]) email = match[1].trim()
+            } catch {}
+            await fs.promises.rm(probeLog, { force: true }).catch(() => {})
             if (probe.err || probe.code !== 0 || !probe.stdout.trim()) {
               const why = probe.timedOut
                 ? "timed out after 15s"
@@ -3454,7 +3566,7 @@ export const AntigravityBridgePlugin = async () => {
                 error: `agy at ${agy} is not signed in (${why}). Run \`agy\` in a terminal once to sign in to your Google account, then try again.`,
               }
             }
-            return { type: "success", key: "agy" }
+            return { type: "success", key: "agy", ...(email ? { accountId: email } : {}) }
           },
         },
       ],
@@ -3621,16 +3733,21 @@ export const AntigravityBridgePlugin = async () => {
         const out = {}
         for (const model of catalog.models) {
           const imageModel = /^(?:gemini-|claude-)/.test(model.id)
+          const contextLimit = /^gemini-/.test(model.id) ? 1048576 : /^claude-/.test(model.id) ? 1000000 : 131072
+          const outputLimit = /^claude-/.test(model.id) ? 128000 : /^gemini-/.test(model.id) ? 65536 : 32768
           out[model.id] = {
             id: model.id,
             name: model.name,
             npm: NPM_ANTHROPIC,
             api: { id: model.id, url: "agy://local", npm: NPM_ANTHROPIC },
+            tool_call: true,
+            limit: { context: contextLimit, output: outputLimit },
             ...(imageModel ? {
               attachment: true,
               modalities: { input: ["text", "image"], output: ["text"] },
             } : {}),
             capabilities: {
+              toolcall: true,
               ...(imageModel ? { attachment: true, input: { text: true, image: true }, output: { text: true } } : {}),
               ...(model.variants ? { reasoning: true } : {}),
             },
@@ -3662,6 +3779,7 @@ process.once("exit", () => {
     if (proc.workspace) {
       try { fs.rmSync(proc.workspace, { recursive: true, force: true }) } catch {}
     }
+    cleanupSessionData(proc.sessionId)
   }
   if (shimDir) {
     try { fs.rmSync(shimDir, { recursive: true, force: true }) } catch {}

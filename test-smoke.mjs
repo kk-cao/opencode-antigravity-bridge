@@ -538,11 +538,12 @@ const legacyModel = "agy-acp/gemini-test-low"
   const usage = await plugin.auth.usage(async () => ({ key: "agy" }), {})
   check("auth.usage exposes measured CLI quota", usage.windows?.[0]?.used === 40 && usage.windows[0].name === "Gemini · 7 days")
   check("auth.usage preserves explicit cadence and reset", usage.windows?.[0]?.span === 604800 && usage.windows[0].resetsAt === "2026-10-27T00:00:00.000Z")
-  check("auth.usage is display-only and keeps bridge auth", usage.windows?.[0]?.aside === true && usage.signIn === "kept")
+  check("auth.usage promotes primary window and keeps bridge auth", !usage.windows?.[0]?.aside && usage.signIn === "kept")
   check("auth.usage does not invent Google account identity", !usage.user && !usage.plan)
   const calls = logs().filter(event => event.type === "usage")
   check("auth.usage uses a separate cleaned workspace", calls.length === 1 && !fs.existsSync(calls[0].cwd))
   check("auth.usage runs only the native usage command", calls[0]?.args.includes("/usage") && calls[0]?.args.includes("magpie-usage"))
+  check("auth declares Magpie maxConcurrency", plugin.auth.maxConcurrency === 16)
 }
 
 {
@@ -550,6 +551,7 @@ const legacyModel = "agy-acp/gemini-test-low"
   check("dynamic models accept tab-separated agy output", !!models["gemini-test"])
   check("dynamic models do not fall back to stale list", !models["gemini-3.7-flash-high"])
   check("models declare Anthropic through OpenCode api.npm", models["gemini-test"]?.api?.npm === "@ai-sdk/anthropic")
+  check("models declare Magpie context/output limits and tool_call", models["gemini-test"]?.limit?.context === 1048576 && models["gemini-test"]?.tool_call === true)
   check("effort variants collapse into one model", !models["gemini-test-low"] && !models["gemini-test-medium"] && !models["gemini-test-high"])
   check("grouped model has a level-free display name", models["gemini-test"]?.name === "Gemini Test")
   check("grouped model declares sorted variants", Object.keys(models["gemini-test"]?.variants || {}).join(",") === "low,medium,high")
