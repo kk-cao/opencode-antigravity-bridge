@@ -1861,6 +1861,7 @@ async function retire(key, proc) {
   proc.retiring = true
   park(proc)
   if (pool.get(key) === proc) pool.delete(key)
+  allProcs.delete(proc)
   await proc.stop().catch(() => {})
 }
 
@@ -1871,11 +1872,20 @@ async function evictIdle() {
     if (proc.retiring) continue
     if (proc.dead || (!proc.turn && proc.lastUsed < cutoff)) victims.push([key, proc])
   }
-  for (const [key, proc] of victims) await retire(key, proc)
-  if (warmStandbyProc && (warmStandbyProc.dead || warmStandbyProc.lastUsed < cutoff)) {
+  for (const [key, proc] of victims) {
+    proc.retiring = true
+    park(proc)
+    if (pool.get(key) === proc) pool.delete(key)
+    allProcs.delete(proc)
+    proc.stop().catch(() => {})
+  }
+  if (warmStandbyProc?.dead) {
     const standby = warmStandbyProc
     warmStandbyProc = null
-    await standby.stop().catch(() => {})
+    standby.stop().catch(() => {})
+  }
+  if (!warmStandbyProc && cachedAgyPath) {
+    scheduleWarmStandby(cachedAgyPath)
   }
 }
 
