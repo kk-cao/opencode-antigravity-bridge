@@ -2182,7 +2182,7 @@ function sessionInstructions(body, callerWorkDir) {
 
 function stripHistoricalAlmaContext(text) {
   return String(text ?? "").replace(
-    /^\s*\[Context:\s*<reminder>Authoritative Local DateTime:[\s\S]*?\]\r?\n\r?\n(?=\[Message sent-at:)/,
+    /(?:^|\r?\n)\s*\[Context:\s*<reminder>Authoritative Local DateTime:[\s\S]*?\]\r?\n\r?\n(?=\[Message sent-at:)/g,
     "",
   )
 }
@@ -2277,23 +2277,24 @@ function renderTurnMessage(message, opts = {}) {
     }
     if (Array.isArray(message.content)) {
       const out = []
-      let afterToolResult = false
+      let afterBlock = false
       for (const block of message.content) {
         if (block?.type === "tool_result") {
-          out.push(blockText(block, opts))
-          afterToolResult = true
+          const text = blockText(block, opts)
+          out.push(afterBlock && text && !text.startsWith("\n") ? "\n\n" + text : text)
+          afterBlock = true
           continue
         }
         const rawBlock = blockText(block, opts)
         const raw = opts.stripHistoricalAlma ? stripHistoricalAlmaContext(rawBlock) : rawBlock
         const queued = block?.type === "text" ? extractQueuedPrompt(raw) : null
         const rendered = queued !== null ? queued : raw
-        if (rendered && afterToolResult && !rendered.startsWith("\n")) {
+        if (rendered && afterBlock && !rendered.startsWith("\n") && !out.at(-1)?.endsWith("\n")) {
           out.push("\n\n" + rendered)
         } else {
           out.push(rendered)
         }
-        if (rendered) afterToolResult = false
+        if (rendered) afterBlock = true
       }
       return out.join("")
     }
@@ -2331,13 +2332,14 @@ function renderTurnMessageParts(message, opts = {}) {
     return text === "" ? [] : [{ type: "text", text }]
   }
   const parts = []
-  let afterToolResult = false
+  let afterBlock = false
   for (const block of message.content) {
     if (block?.type === "image") {
       parts.push(parseUserImage(block))
-      afterToolResult = false
+      afterBlock = false
     } else if (block?.type === "tool_result") {
-      appendPrompt(parts, `[tool result${block.tool_use_id ? " id=" + block.tool_use_id : ""}]\n`)
+      const prefix = afterBlock && parts.at(-1)?.type === "text" && !parts.at(-1).text.endsWith("\n") ? "\n\n" : ""
+      appendPrompt(parts, `${prefix}[tool result${block.tool_use_id ? " id=" + block.tool_use_id : ""}]\n`)
       const result = toolResult(block)
       for (const part of result.content) {
         if (part.type === "text" && opts.maxToolResultChars) {
@@ -2350,14 +2352,16 @@ function renderTurnMessageParts(message, opts = {}) {
         }
       }
       appendPrompt(parts, "\n[end of tool result]")
-      afterToolResult = true
+      afterBlock = true
     } else {
       const rawBlock = blockText(block, opts)
       const raw = opts.stripHistoricalAlma ? stripHistoricalAlmaContext(rawBlock) : rawBlock
       const queued = block?.type === "text" ? extractQueuedPrompt(raw) : null
       const rendered = queued !== null ? queued : raw
-      appendPrompt(parts, rendered && afterToolResult && !rendered.startsWith("\n") ? "\n\n" + rendered : rendered)
-      if (rendered) afterToolResult = false
+      const needsSep = rendered && afterBlock && !rendered.startsWith("\n") &&
+        parts.at(-1)?.type === "text" && !parts.at(-1).text.endsWith("\n")
+      appendPrompt(parts, needsSep ? "\n\n" + rendered : rendered)
+      if (rendered) afterBlock = true
     }
   }
   return toPromptParts(parts)
@@ -2734,9 +2738,13 @@ function inspectToolTurn(results, body) {
       } else if (!isNoise(rest)) {
         if ((hookOutput.test(rest) || claudeMetaFeedback.test(rest)) && !userInterruption.test(rest)) {
           notices.push(rest)
-        } else if (userSteered || stoppedByHookOrUser || notices.some((item) => hookStoppedContinuation.test(item)) ||
-          (!hasStrictNotice && !matchedReminders.length && !hookOutput.test(rest))) {
+        } else if (userSteered || stoppedByHookOrUser || skillIndex >= 0 ||
+          notices.some((item) => hookStoppedContinuation.test(item))) {
           userSteered = true
+        } else if (!hasStrictNotice && !matchedReminders.length && !hookOutput.test(rest)) {
+          notices.push(
+            `The user sent a new message while you were working:\n${rest}\n\nIMPORTANT: Address the user's message above and continue with your tasks.`,
+          )
         } else {
           throw new UnsupportedContent("text beside a live tool_result; send it after the tool response completes")
         }
