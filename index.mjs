@@ -1806,7 +1806,7 @@ function takeParked(convKey, opts) {
   return { sessionId: entry.sessionId, expectedMessages: opts.history }
 }
 
-const WARM_STANDBY_MAX = 2
+const WARM_STANDBY_MAX = 3
 const warmStandbyProcs = []
 const warmStandbyPromises = new Set()
 let warmStandbyTimer = null
@@ -1827,7 +1827,7 @@ function pruneWarmStandby() {
   }
 }
 
-function scheduleWarmStandby(agyPath, delayMs = 300) {
+function scheduleWarmStandby(agyPath, delayMs = 200) {
   if (!agyPath || !warmStandbyEnabled()) return
   pruneWarmStandby()
   if (warmStandbyProcs.length + warmStandbyPromises.size >= WARM_STANDBY_MAX) return
@@ -1866,10 +1866,14 @@ function scheduleWarmStandby(agyPath, delayMs = 300) {
 async function takeWarmStandby(agyPath) {
   if (!warmStandbyEnabled()) return null
   pruneWarmStandby()
+  if (!warmStandbyProcs.length && warmStandbyPromises.size) {
+    await Promise.race([...warmStandbyPromises]).catch(() => {})
+    pruneWarmStandby()
+  }
   while (warmStandbyProcs.length) {
     const proc = warmStandbyProcs.shift()
     if (!proc.dead && !proc.retiring && proc.agyPath === agyPath) {
-      scheduleWarmStandby(agyPath, 100)
+      scheduleWarmStandby(agyPath, 50)
       return proc
     }
     await proc.stop().catch(() => {})
@@ -2349,10 +2353,12 @@ const CODEX_ITEM_INPUT_SCHEMA = {
   additionalProperties: false,
 }
 
+const CODEX_LOCKED_MULTI_AGENT_NOTE = "[DEFERRED TOOL - LOCKED UNTIL UNLOCKED BY tool_search] You MUST call mcp_ide-tools_tool_search({query: \"multi_agent_v1\"}) once in this conversation BEFORE calling this tool, otherwise the client will reject the call with \"unsupported call\". "
+
 const CODEX_PREDECLARED_MULTI_AGENT_TOOLS = [
   {
     name: "multi_agent_v1__spawn_agent",
-    description: "Spawn a sub-agent for a well-scoped task. Returns the spawned agent id plus the user-facing nickname when available. Omit model and reasoning_effort unless an explicit override is needed.",
+    description: CODEX_LOCKED_MULTI_AGENT_NOTE + "Spawn a sub-agent for a well-scoped task. Omit model and reasoning_effort unless an explicit override is needed.",
     inputSchema: {
       type: "object",
       properties: {
@@ -2368,7 +2374,7 @@ const CODEX_PREDECLARED_MULTI_AGENT_TOOLS = [
   },
   {
     name: "multi_agent_v1__wait_agent",
-    description: "Wait for agents to reach a final status. Completed statuses may include the agent final message.",
+    description: CODEX_LOCKED_MULTI_AGENT_NOTE + "Wait for agents to reach a final status.",
     inputSchema: {
       type: "object",
       properties: {
@@ -2381,7 +2387,7 @@ const CODEX_PREDECLARED_MULTI_AGENT_TOOLS = [
   },
   {
     name: "multi_agent_v1__send_input",
-    description: "Send a message to an existing agent. Use interrupt=true to redirect work immediately.",
+    description: CODEX_LOCKED_MULTI_AGENT_NOTE + "Send a message to an existing agent.",
     inputSchema: {
       type: "object",
       properties: {
@@ -2396,7 +2402,7 @@ const CODEX_PREDECLARED_MULTI_AGENT_TOOLS = [
   },
   {
     name: "multi_agent_v1__close_agent",
-    description: "Close an agent and any open descendants when they are no longer needed.",
+    description: CODEX_LOCKED_MULTI_AGENT_NOTE + "Close an agent and any open descendants when they are no longer needed.",
     inputSchema: {
       type: "object",
       properties: {
@@ -2408,7 +2414,7 @@ const CODEX_PREDECLARED_MULTI_AGENT_TOOLS = [
   },
   {
     name: "multi_agent_v1__resume_agent",
-    description: "Resume a previously closed agent by id so it can receive send_input and wait_agent calls.",
+    description: CODEX_LOCKED_MULTI_AGENT_NOTE + "Resume a previously closed agent by id.",
     inputSchema: {
       type: "object",
       properties: {
