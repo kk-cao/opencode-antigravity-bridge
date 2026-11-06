@@ -12,8 +12,8 @@ const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "agy-compat-test-"))
 const entry = new URL("./index.mjs", import.meta.url)
 let source = fs.readFileSync(entry, "utf8")
 source = source.replace(/from "(\.\/[^"\n]+)"/g, (_, target) => `from ${JSON.stringify(new URL(target, entry).href)}`)
-fs.writeFileSync(path.join(workspace, "bridge.mjs"), source + "\nexport { inspectToolTurn, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, withStateLock, Turn, translateUsage, conversationKey, instructionsKey, extractDynamicSystemBlocks, MAGPIE_PLACEHOLDER_NOTICE };\n")
-const { inspectToolTurn, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, withStateLock, Turn, translateUsage, conversationKey, instructionsKey, extractDynamicSystemBlocks, MAGPIE_PLACEHOLDER_NOTICE, AntigravityBridgePlugin } = await import(pathToFileURL(path.join(workspace, "bridge.mjs")).href)
+fs.writeFileSync(path.join(workspace, "bridge.mjs"), source + "\nexport { inspectToolTurn, canReplayFollowUpAfterResults, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, withStateLock, Turn, translateUsage, conversationKey, instructionsKey, extractDynamicSystemBlocks, MAGPIE_PLACEHOLDER_NOTICE };\n")
+const { inspectToolTurn, canReplayFollowUpAfterResults, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, withStateLock, Turn, translateUsage, conversationKey, instructionsKey, extractDynamicSystemBlocks, MAGPIE_PLACEHOLDER_NOTICE, AntigravityBridgePlugin } = await import(pathToFileURL(path.join(workspace, "bridge.mjs")).href)
 after(() => fs.rmSync(workspace, { recursive: true, force: true }))
 
 const image = { type: "image", source: { type: "base64", media_type: "image/png", data: "aW1hZ2VB" } }
@@ -56,6 +56,35 @@ test("Codex context notices and mid-turn steered user text keep live session", (
   ]))
   assert.equal(steered.userSteered, false)
   assert.ok(steered.results[0].result.content.at(-1).text.includes("CVE-2026-98432 这个是不是都升级好了"))
+
+  const steeredWithoutContextTag = inspectToolTurn([patch], bodyFor([
+    patch.block,
+    { type: "text", text: "现在的版本在 \"D:\\Program Files\\codex-lite.exe\"\n" },
+  ]))
+  assert.equal(steeredWithoutContextTag.userSteered, false)
+  assert.ok(steeredWithoutContextTag.results[0].result.content.at(-1).text.includes("现在的版本在 \"D:\\Program Files\\codex-lite.exe\""))
+
+  const skill = result("call_skill", "Skill", "Launching skill: archive")
+  const steeredSkill = inspectToolTurn([skill], bodyFor([
+    skill.block,
+    { type: "text", text: "Stop this task and explain something else" },
+  ]))
+  assert.equal(steeredSkill.userSteered, true)
+
+  const standaloneFollowUpBody = {
+    messages: [
+      { role: "assistant", content: [] },
+      { role: "user", content: [patch.block] },
+      { role: "user", content: "Standalone follow-up user instruction" },
+    ],
+  }
+  assert.throws(() => inspectToolTurn([patch], standaloneFollowUpBody), /text beside a live tool_result/)
+  assert.equal(canReplayFollowUpAfterResults(standaloneFollowUpBody, [patch]), true)
+
+  assert.throws(
+    () => inspectToolTurn([patch], bodyFor([patch.block, { type: "text", text: "extra user text\n<task-notification>background completed</task-notification>" }])),
+    /text beside a live tool_result/,
+  )
 })
 
 test("a partial ID rename maps by full history without discarding the live ID anchor", () => {

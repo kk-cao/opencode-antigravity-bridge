@@ -2962,7 +2962,6 @@ function inspectToolTurn(results, body) {
   let userSteered = false
   const notices = []
   let seenResult = false
-  let seenCodexContext = false
   let resultIndex = -1
   const stoppedByHookOrUser = out.some((item) => item.result?.isError &&
     /^(?:The user doesn't want to proceed with this tool use\.|User rejected tool use\b|Operation stopped by hook\b|Execution stopped by hook\b|Blocked by PreToolUse hook\b|Hook PreToolUse:\S+ denied\b|API Error: Request was aborted\.|\[Request interrupted by user\b)/.test(resultText(item.result).trim()))
@@ -2980,6 +2979,7 @@ function inspectToolTurn(results, body) {
   const isNoise = (value) => !value || tokenNoise.test(value) || hookBoilerplateNoise.test(value)
   for (const message of trailingMessages(body).messages) {
     const blocks = Array.isArray(message.content) ? message.content : [message.content]
+    const messageHasToolResult = blocks.some((item) => item?.type === "tool_result")
     for (const block of blocks) {
       if (block?.type === "tool_result") {
         seenResult = true
@@ -3000,10 +3000,7 @@ function inspectToolTurn(results, body) {
         if (preRest) {
           throw new UnsupportedContent("text beside a live tool_result; send it after the tool response completes")
         }
-        if (preCodex.length) {
-          seenCodexContext = true
-          notices.push(...preCodex)
-        }
+        if (preCodex.length) notices.push(...preCodex)
         continue
       }
       const text = stripMagpiePlaceholderNotice(rawText)
@@ -3053,10 +3050,8 @@ function inspectToolTurn(results, body) {
         }
       }
       const hasStrictNotice = /<(?:system-update|task-notification)\b/.test(text)
-      const matchedCodex = Array.from(text.matchAll(CODEX_CONTEXT_RE), (match) => match[0])
-      if (matchedCodex.length) seenCodexContext = true
       notices.push(...Array.from(text.matchAll(CONTEXT_NOTICE_RE), (match) => match[0]))
-      notices.push(...matchedCodex)
+      notices.push(...Array.from(text.matchAll(CODEX_CONTEXT_RE), (match) => match[0]))
       const withoutNotices = text.replace(CONTEXT_NOTICE_RE, "").replace(CODEX_CONTEXT_RE, "")
       const matchedReminders = Array.from(withoutNotices.matchAll(SYSTEM_REMINDER_RE))
       for (const match of matchedReminders) {
@@ -3080,14 +3075,14 @@ function inspectToolTurn(results, body) {
       } else if (!isNoise(rest)) {
         if ((hookOutput.test(rest) || claudeMetaFeedback.test(rest)) && !userInterruption.test(rest)) {
           notices.push(rest)
-        } else if (seenCodexContext && !userInterruption.test(rest) && !hasStrictNotice && !matchedReminders.length && !hookOutput.test(rest) && skillIndex < 0) {
-          notices.push(
-            `The user sent a new message while you were working:\n${rest}\n\nIMPORTANT: Address the user's message above and continue with your tasks.`,
-          )
         } else if ((userSteered || stoppedByHookOrUser || skillIndex >= 0 ||
           notices.some((item) => hookStoppedContinuation.test(item))) &&
           !hasStrictNotice && !matchedReminders.length && !hookOutput.test(rest)) {
           userSteered = true
+        } else if (messageHasToolResult && !userInterruption.test(rest) && !hasStrictNotice && !matchedReminders.length && !hookOutput.test(rest) && skillIndex < 0) {
+          notices.push(
+            `The user sent a new message while you were working:\n${rest}\n\nIMPORTANT: Address the user's message above and continue with your tasks.`,
+          )
         } else {
           throw new UnsupportedContent("text beside a live tool_result; send it after the tool response completes")
         }
