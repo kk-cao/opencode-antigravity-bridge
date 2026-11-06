@@ -1806,7 +1806,7 @@ function takeParked(convKey, opts) {
   return { sessionId: entry.sessionId, expectedMessages: opts.history }
 }
 
-const WARM_STANDBY_MAX = 3
+const WARM_STANDBY_MAX = 4
 const warmStandbyProcs = []
 const warmStandbyPromises = new Set()
 let warmStandbyTimer = null
@@ -1836,6 +1836,13 @@ function scheduleWarmStandby(agyPath, delayMs = 200) {
     warmStandbyTimer = null
     if (!warmStandbyEnabled()) return
     pruneWarmStandby()
+    if (
+      process.env.AGY_BRIDGE_WARM_STANDBY !== "1" &&
+      [...allProcs].some((proc) => proc.turn && !proc.dead && !proc.retiring)
+    ) {
+      scheduleWarmStandby(agyPath, 4000)
+      return
+    }
     while (warmStandbyProcs.length + warmStandbyPromises.size < WARM_STANDBY_MAX) {
       if (allProcs.size >= MAX_IDLE_PROCS) {
         if (!(await evictLRU())) break
