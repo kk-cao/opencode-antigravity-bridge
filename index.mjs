@@ -1,4 +1,5 @@
 import { agyCandidates, spawnAgy, windowsMcpShim } from "./platform.mjs"
+import { spawn } from "node:child_process"
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto"
 import { once } from "node:events"
 import fs from "node:fs"
@@ -100,10 +101,11 @@ function execOnce(file, args, opts = {}) {
   return new Promise((resolve) => {
     let child
     try {
-      child = spawnAgy(file, args, {
+      const launch = file === "taskkill" ? spawn : spawnAgy
+      child = launch(file, args, {
         stdio: ["ignore", "pipe", "pipe"],
-        windowsHide: true,
         ...opts,
+        windowsHide: true,
       })
     } catch (err) {
       resolve({ err, stdout: "", stderr: "", code: null, timedOut: false })
