@@ -16,7 +16,7 @@ const MCP_SERVER_PATH = fileURLToPath(new URL("./mcp-server.mjs", import.meta.ur
 // agy exposes tools from the --ide-mcp-port server as direct functions with this prefix.
 const IDE_TOOL_PREFIX = "mcp_ide-tools_"
 const IDLE_MS = positiveTimeout(process.env.AGY_BRIDGE_IDLE_MS, 30 * 60 * 1000)
-const MAX_IDLE_PROCS = positiveTimeout(process.env.AGY_BRIDGE_MAX_IDLE_PROCS, 4)
+const MAX_IDLE_PROCS = positiveTimeout(process.env.AGY_BRIDGE_MAX_IDLE_PROCS, 8)
 const MAX_PROCS = positiveTimeout(process.env.AGY_BRIDGE_MAX_PROCS, 16)
 const MAX_PARKED = 64
 const DEFAULT_PROC_START_TIMEOUT_MS = 60_000
@@ -1832,14 +1832,14 @@ function scheduleWarmStandby(agyPath, delayMs = 200) {
   pruneWarmStandby()
   if (warmStandbyProcs.length + warmStandbyPromises.size >= WARM_STANDBY_MAX) return
   if (warmStandbyTimer) clearTimeout(warmStandbyTimer)
-  const run = () => {
+  const run = async () => {
     warmStandbyTimer = null
     if (!warmStandbyEnabled()) return
     pruneWarmStandby()
-    while (
-      warmStandbyProcs.length + warmStandbyPromises.size < WARM_STANDBY_MAX &&
-      allProcs.size < MAX_IDLE_PROCS
-    ) {
+    while (warmStandbyProcs.length + warmStandbyPromises.size < WARM_STANDBY_MAX) {
+      if (allProcs.size >= MAX_IDLE_PROCS) {
+        if (!(await evictLRU())) break
+      }
       const proc = new Proc(agyPath, "__standby__", {})
       const p = proc.start(true).then(() => {
         if (!proc.dead && !proc.retiring && warmStandbyProcs.length < WARM_STANDBY_MAX) {
@@ -1856,10 +1856,10 @@ function scheduleWarmStandby(agyPath, delayMs = 200) {
     }
   }
   if (delayMs > 0) {
-    warmStandbyTimer = setTimeout(run, delayMs)
+    warmStandbyTimer = setTimeout(() => { run().catch(() => {}) }, delayMs)
     warmStandbyTimer.unref?.()
   } else {
-    run()
+    run().catch(() => {})
   }
 }
 
@@ -1870,10 +1870,11 @@ async function takeWarmStandby(agyPath) {
     await Promise.race([...warmStandbyPromises]).catch(() => {})
     pruneWarmStandby()
   }
+  const replenishDelayMs = process.env.AGY_BRIDGE_WARM_STANDBY === "1" ? 50 : 3500
   while (warmStandbyProcs.length) {
     const proc = warmStandbyProcs.shift()
     if (!proc.dead && !proc.retiring && proc.agyPath === agyPath) {
-      scheduleWarmStandby(agyPath, 50)
+      scheduleWarmStandby(agyPath, replenishDelayMs)
       return proc
     }
     await proc.stop().catch(() => {})
@@ -1990,7 +1991,6 @@ async function acquireProc(agyPath, convKey, opts, isFreshConversation, forceNew
       try {
         await standby.bindSession(targetKey, { ...opts, resume })
         pool.set(targetKey, standby)
-        scheduleWarmStandby(agyPath)
         return { proc: standby, history: opts.history }
       } catch {
         await standby.stop().catch(() => {})
