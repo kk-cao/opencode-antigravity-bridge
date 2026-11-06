@@ -2354,6 +2354,9 @@ function normalizeTools(body) {
     if (seen.has(tool.name)) throw new UnsupportedContent(`duplicate tool ${tool.name}`)
     seen.add(tool.name)
     if (selected && tool.name !== selected) continue
+    // agy prefixes IDE MCP tools with IDE_TOOL_PREFIX ("mcp_ide-tools_") and
+    // rejects any prefixed name violating ^[a-zA-Z0-9_-]{1,64}$.
+    if (!selected && !/^[a-zA-Z0-9_-]{1,64}$/.test(IDE_TOOL_PREFIX + tool.name)) continue
     const rawSchema = tool.input_schema ?? { type: "object", properties: {} }
     if (!rawSchema || typeof rawSchema !== "object" || Array.isArray(rawSchema)) {
       throw new UnsupportedContent(`an invalid schema for tool ${tool.name}`)
@@ -2389,6 +2392,19 @@ function compactMiddleText(text, maxChars, label = "historical tool output") {
   return `${str.slice(0, half)}\n...[${label} compacted (${omitted} chars omitted to preserve recent conversation context)]...\n${str.slice(str.length - half)}`
 }
 
+function prefixToolSearchText(text) {
+  if (typeof text !== "string" || !text.includes("These tools are now available to call:")) return text
+  return text.replace(
+    /(These tools are now available to call:\s*)([a-zA-Z0-9_,\s-]+)/g,
+    (_m, header, list) => header + list.split(",").map((item) => {
+      const name = item.trim()
+      if (!name) return item
+      if (!/^[a-zA-Z0-9_-]{1,64}$/.test(IDE_TOOL_PREFIX + name)) return name
+      return name.startsWith(IDE_TOOL_PREFIX) ? name : `${IDE_TOOL_PREFIX}${name}`
+    }).join(", "),
+  )
+}
+
 function blockText(block, opts = {}) {
   if (typeof block === "string") return block
   if (!block || typeof block !== "object" || Array.isArray(block)) {
@@ -2406,12 +2422,12 @@ function blockText(block, opts = {}) {
     return "[image]"
   }
   if (block.type === "tool_result") {
-    const rawInner = Array.isArray(block.content)
+    const rawInner = prefixToolSearchText(Array.isArray(block.content)
       ? block.content.map((part) => {
         if (part?.type === "image") return "[image returned by tool]"
         return blockText(part)
       }).join("")
-      : String(block.content ?? "")
+      : String(block.content ?? ""))
     const inner = opts.maxToolResultChars
       ? compactMiddleText(rawInner, opts.maxToolResultChars, opts.toolResultLabel || "historical tool output")
       : rawInner
@@ -2857,10 +2873,10 @@ function toolResult(block) {
   }
   let content
   if (typeof block.content === "string") {
-    content = [{ type: "text", text: block.content }]
+    content = [{ type: "text", text: prefixToolSearchText(block.content) }]
   } else if (Array.isArray(block.content)) {
     content = block.content.map((part) => {
-      if (part?.type === "text" && typeof part.text === "string") return { type: "text", text: part.text }
+      if (part?.type === "text" && typeof part.text === "string") return { type: "text", text: prefixToolSearchText(part.text) }
       if (part?.type === "tool_reference" && typeof part.tool_name === "string") {
         return { type: "text", text: `Loaded tool: ${part.tool_name}` }
       }
@@ -3859,11 +3875,15 @@ export const AntigravityBridgePlugin = async () => {
                   const historyMatches = directIdsMatch
                     ? proc.matchesPendingTurnHistory(turn, trailingMessages(body).history)
                     : proc.matchesHistory(trailingMessages(body).history)
-                  if (interrupted || !historyMatches ||
+                  const declaredTools = new Set((proc.tools || []).map((item) => item.name))
+                  const unlockedByToolSearch = tools.some((item) => !declaredTools.has(item.name)) &&
+                    rawResults.some((item) => /^(?:tool_search|ToolSearch)$/i.test(item.call?.name || ""))
+                  if (interrupted || !historyMatches || unlockedByToolSearch ||
                     proc.workDir !== workDir || instructionsKey(proc.instructions) !== instructionsKey(instructions)) {
-                    // A changed context or user-interrupted tool turn needs a new
-                    // session. Replay the real results without resolving the old
-                    // process's calls.
+                    // A changed context, deferred tools newly unlocked by tool_search,
+                    // or user-interrupted tool turn needs a new session so agy rebuilds its
+                    // executor with the updated tool declarations. Replay the real results
+                    // without resolving the old process's calls.
                     dropFromPool(proc)
                     proc.stopping = true
                     await proc.stop()

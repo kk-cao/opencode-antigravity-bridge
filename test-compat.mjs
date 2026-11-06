@@ -12,8 +12,8 @@ const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "agy-compat-test-"))
 const entry = new URL("./index.mjs", import.meta.url)
 let source = fs.readFileSync(entry, "utf8")
 source = source.replace(/from "(\.\/[^"\n]+)"/g, (_, target) => `from ${JSON.stringify(new URL(target, entry).href)}`)
-fs.writeFileSync(path.join(workspace, "bridge.mjs"), source + "\nexport { inspectToolTurn, canReplayFollowUpAfterResults, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, withStateLock, Turn, translateUsage, conversationKey, instructionsKey, extractDynamicSystemBlocks, MAGPIE_PLACEHOLDER_NOTICE };\n")
-const { inspectToolTurn, canReplayFollowUpAfterResults, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, withStateLock, Turn, translateUsage, conversationKey, instructionsKey, extractDynamicSystemBlocks, MAGPIE_PLACEHOLDER_NOTICE, AntigravityBridgePlugin } = await import(pathToFileURL(path.join(workspace, "bridge.mjs")).href)
+fs.writeFileSync(path.join(workspace, "bridge.mjs"), source + "\nexport { inspectToolTurn, canReplayFollowUpAfterResults, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, withStateLock, Turn, translateUsage, conversationKey, instructionsKey, extractDynamicSystemBlocks, MAGPIE_PLACEHOLDER_NOTICE, normalizeTools, toolResult, blockText };\n")
+const { inspectToolTurn, canReplayFollowUpAfterResults, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, withStateLock, Turn, translateUsage, conversationKey, instructionsKey, extractDynamicSystemBlocks, MAGPIE_PLACEHOLDER_NOTICE, normalizeTools, toolResult, blockText, AntigravityBridgePlugin } = await import(pathToFileURL(path.join(workspace, "bridge.mjs")).href)
 after(() => fs.rmSync(workspace, { recursive: true, force: true }))
 
 const image = { type: "image", source: { type: "base64", media_type: "image/png", data: "aW1hZ2VB" } }
@@ -236,4 +236,26 @@ test("x-magpie-session header and instructionsKey/historyKey normalize dynamic m
     ],
   }
   assert.equal(historyKey([almaMsgA]), historyKey([almaMsgB]))
+})
+
+test("normalizeTools filters tool names exceeding agy 64-char prefixed limit and prefixToolSearchText prefixes unlocked tools", () => {
+  const tools = normalizeTools({
+    tools: [
+      { name: "multi_agent_v1__spawn_agent", description: "Spawn subagent", input_schema: { type: "object" } },
+      { name: "mcp__codex_security__update_codex_security_scan_context", description: "Too long (69 chars with prefix)", input_schema: { type: "object" } },
+    ],
+  })
+  assert.deepEqual(tools.map(t => t.name), ["multi_agent_v1__spawn_agent"])
+
+  const block = {
+    type: "tool_result",
+    tool_use_id: "call_ts_1",
+    content: "These tools are now available to call: multi_agent_v1__wait_agent, multi_agent_v1__spawn_agent",
+  }
+  const res = toolResult(block)
+  assert.equal(
+    res.content[0].text,
+    "These tools are now available to call: mcp_ide-tools_multi_agent_v1__wait_agent, mcp_ide-tools_multi_agent_v1__spawn_agent",
+  )
+  assert.ok(blockText(block).includes("mcp_ide-tools_multi_agent_v1__spawn_agent"))
 })
