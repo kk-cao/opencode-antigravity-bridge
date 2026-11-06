@@ -259,3 +259,18 @@ test("normalizeTools filters tool names exceeding agy 64-char prefixed limit and
   )
   assert.ok(blockText(block).includes("mcp_ide-tools_multi_agent_v1__spawn_agent"))
 })
+
+test("normalizeTools predeclares Codex multi_agent_v1 tools when tool_search and exec_command are present", () => {
+  const initialTools = normalizeTools({
+    tools: [
+      { name: "exec_command", description: "Run command", input_schema: { type: "object" } },
+      { name: "tool_search", description: "Search deferred tools", input_schema: { type: "object" } },
+    ],
+  })
+  const names = initialTools.map((t) => t.name)
+  assert.ok(names.includes("multi_agent_v1__spawn_agent"))
+  assert.ok(names.includes("multi_agent_v1__wait_agent"))
+  assert.ok(names.includes("multi_agent_v1__send_input"))
+  assert.ok(names.includes("multi_agent_v1__close_agent"))
+  assert.ok(names.includes("multi_agent_v1__resume_agent"))
+})

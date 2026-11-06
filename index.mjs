@@ -958,21 +958,21 @@ class Proc {
   }
 
   // Swap the client tool catalog in place; agy re-lists on tools/list_changed.
-  async updateTools(tools) {
+  async updateTools(tools, waitForList = true) {
     const signature = JSON.stringify(tools)
     if (signature === this.toolsSignature) return
     this.tools = tools
     this.toolsSignature = signature
-    await this.#announceTools()
+    await this.#announceTools(waitForList)
   }
 
-  async #announceTools() {
+  async #announceTools(waitForList = true) {
     const version = ++this.toolsVersion
     if (!this.watchers.size) return
     for (const socket of this.watchers) {
       try { socket.write(JSON.stringify({ event: "tools_changed" }) + "\n") } catch {}
     }
-    await this.#waitForToolList(version)
+    if (waitForList) await this.#waitForToolList(version)
   }
 
   #onRequest(method, params) {
@@ -1242,8 +1242,9 @@ class Proc {
     if (!args || typeof args !== "object" || Array.isArray(args)) throw new Error("agy bridge: invalid tool arguments")
     if (!this.tools.some((tool) => tool.name === name)) throw new Error(`agy bridge: undeclared tool ${name}`)
     const signature = stableJSON(args)
-    const running = turn.calls.find((call) => call.deferred && !call.lateDelivered &&
-      call.name === name && stableJSON(call.arguments) === signature)
+    const deferredCalls = turn.calls.filter((call) => call.deferred && !call.lateDelivered)
+    const running = deferredCalls.find((call) => call.name === name && stableJSON(call.arguments) === signature)
+      || (!turn.attached && deferredCalls.length ? deferredCalls[deferredCalls.length - 1] : null)
     if (running) return this.#acceptWait(turn, running, socket)
     const call = {
       id: "toolu_" + randomUUID().replace(/-/g, "").slice(0, 24),
@@ -1805,8 +1806,9 @@ function takeParked(convKey, opts) {
   return { sessionId: entry.sessionId, expectedMessages: opts.history }
 }
 
-let warmStandbyProc = null
-let warmStandbyPromise = null
+const WARM_STANDBY_MAX = 2
+const warmStandbyProcs = []
+const warmStandbyPromises = new Set()
 let warmStandbyTimer = null
 
 function warmStandbyEnabled() {
@@ -1815,36 +1817,43 @@ function warmStandbyEnabled() {
   return true
 }
 
-function scheduleWarmStandby(agyPath, delayMs = 3000) {
+function pruneWarmStandby() {
+  for (let i = warmStandbyProcs.length - 1; i >= 0; i--) {
+    const proc = warmStandbyProcs[i]
+    if (proc.dead || proc.retiring) {
+      warmStandbyProcs.splice(i, 1)
+      proc.stop().catch(() => {})
+    }
+  }
+}
+
+function scheduleWarmStandby(agyPath, delayMs = 300) {
   if (!agyPath || !warmStandbyEnabled()) return
-  if (warmStandbyProc && !warmStandbyProc.dead && !warmStandbyProc.retiring) return
-  if (warmStandbyPromise) return
+  pruneWarmStandby()
+  if (warmStandbyProcs.length + warmStandbyPromises.size >= WARM_STANDBY_MAX) return
   if (warmStandbyTimer) clearTimeout(warmStandbyTimer)
   const run = () => {
     warmStandbyTimer = null
     if (!warmStandbyEnabled()) return
-    if (warmStandbyProc && !warmStandbyProc.dead && !warmStandbyProc.retiring) return
-    if (warmStandbyPromise) return
-    if (allProcs.size >= MAX_IDLE_PROCS) return
-    for (const p of pool.values()) {
-      if (p.turn && !p.dead) {
-        scheduleWarmStandby(agyPath, 3000)
-        return
-      }
-    }
-    const proc = new Proc(agyPath, "__standby__", {})
-    const p = proc.start(true).then(() => {
-      if (!proc.dead && !proc.retiring && warmStandbyPromise === p && !warmStandbyProc) {
-        warmStandbyProc = proc
-      } else {
+    pruneWarmStandby()
+    while (
+      warmStandbyProcs.length + warmStandbyPromises.size < WARM_STANDBY_MAX &&
+      allProcs.size < MAX_IDLE_PROCS
+    ) {
+      const proc = new Proc(agyPath, "__standby__", {})
+      const p = proc.start(true).then(() => {
+        if (!proc.dead && !proc.retiring && warmStandbyProcs.length < WARM_STANDBY_MAX) {
+          warmStandbyProcs.push(proc)
+        } else {
+          proc.stop().catch(() => {})
+        }
+      }, () => {
         proc.stop().catch(() => {})
-      }
-    }, () => {
-      proc.stop().catch(() => {})
-    }).finally(() => {
-      if (warmStandbyPromise === p) warmStandbyPromise = null
-    })
-    warmStandbyPromise = p
+      }).finally(() => {
+        warmStandbyPromises.delete(p)
+      })
+      warmStandbyPromises.add(p)
+    }
   }
   if (delayMs > 0) {
     warmStandbyTimer = setTimeout(run, delayMs)
@@ -1856,14 +1865,13 @@ function scheduleWarmStandby(agyPath, delayMs = 3000) {
 
 async function takeWarmStandby(agyPath) {
   if (!warmStandbyEnabled()) return null
-  if (warmStandbyTimer) {
-    clearTimeout(warmStandbyTimer)
-    warmStandbyTimer = null
-  }
-  if (warmStandbyProc) {
-    const proc = warmStandbyProc
-    warmStandbyProc = null
-    if (!proc.dead && !proc.retiring && proc.agyPath === agyPath) return proc
+  pruneWarmStandby()
+  while (warmStandbyProcs.length) {
+    const proc = warmStandbyProcs.shift()
+    if (!proc.dead && !proc.retiring && proc.agyPath === agyPath) {
+      scheduleWarmStandby(agyPath, 100)
+      return proc
+    }
     await proc.stop().catch(() => {})
   }
   return null
@@ -1891,12 +1899,8 @@ async function evictIdle() {
     allProcs.delete(proc)
     proc.stop().catch(() => {})
   }
-  if (warmStandbyProc?.dead) {
-    const standby = warmStandbyProc
-    warmStandbyProc = null
-    standby.stop().catch(() => {})
-  }
-  if (!warmStandbyProc && cachedAgyPath) {
+  pruneWarmStandby()
+  if (warmStandbyProcs.length < WARM_STANDBY_MAX && cachedAgyPath) {
     scheduleWarmStandby(cachedAgyPath)
   }
 }
@@ -1943,7 +1947,13 @@ async function acquireProc(agyPath, convKey, opts, isFreshConversation, forceNew
         const sameInFlightRequest = Array.isArray(opts.messages) && Array.isArray(existing.expectedMessages) &&
           historyKey(opts.messages) === (existing.expectedHistoryKey ?? (existing.expectedHistoryKey = historyKey(existing.expectedMessages)))
         if (isFreshConversation && !forceNew && (!sameInFlightRequest || (existing.turn.hasPendingMcp() && !existing.turn.attached))) {
-          targetKey = `${convKey}:sub:${randomUUID()}`
+          if (!existing.turn.attached && existing.turn.calls.some((call) => call.deferred && !call.result)) {
+            existing.retiring = true
+            dropFromPool(existing)
+            existing.timeoutTurn(existing.turn, new Error("agy bridge: retiring abandoned deferred turn for fresh conversation"))
+          } else {
+            targetKey = `${convKey}:sub:${randomUUID()}`
+          }
         } else {
           throw new BusyError("agy bridge: this conversation still has an unfinished response")
         }
@@ -1983,9 +1993,8 @@ async function acquireProc(agyPath, convKey, opts, isFreshConversation, forceNew
       }
     }
     while (allProcs.size >= MAX_IDLE_PROCS) {
-      if (warmStandbyProc) {
-        const victim = warmStandbyProc
-        warmStandbyProc = null
+      if (warmStandbyProcs.length) {
+        const victim = warmStandbyProcs.pop()
         await victim.stop().catch(() => {})
         continue
       }
@@ -2327,6 +2336,90 @@ function sanitizeInputSchema(schema) {
   return out
 }
 
+const CODEX_ITEM_INPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    audio_url: { type: "string", description: "Audio data URL when type is audio." },
+    image_url: { type: "string", description: "Image URL when type is image." },
+    name: { type: "string", description: "Display name when type is skill or mention." },
+    path: { type: "string", description: "Path when type is local_image/local_audio/skill, or structured mention target." },
+    text: { type: "string", description: "Text content when type is text." },
+    type: { type: "string", description: "Input item type: text, image, local_image, audio, local_audio, skill, or mention." },
+  },
+  additionalProperties: false,
+}
+
+const CODEX_PREDECLARED_MULTI_AGENT_TOOLS = [
+  {
+    name: "multi_agent_v1__spawn_agent",
+    description: "Spawn a sub-agent for a well-scoped task. Returns the spawned agent id plus the user-facing nickname when available. Omit model and reasoning_effort unless an explicit override is needed.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        agent_type: { type: "string", description: "Agent role name (e.g. explorer, planner, worker, designer, evaluator, default)." },
+        fork_context: { type: "boolean", description: "True forks the current thread history into the new agent; false or omitted starts with only the initial prompt." },
+        items: { type: "array", description: "Structured input items.", items: CODEX_ITEM_INPUT_SCHEMA },
+        message: { type: "string", description: "Initial plain-text task for the new agent. Use either message or items." },
+        model: { type: "string", description: "Model override for the new agent. Omit unless an explicit override is needed." },
+        reasoning_effort: { type: "string", description: "Reasoning effort override for the new agent. Omit to use the role default." },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "multi_agent_v1__wait_agent",
+    description: "Wait for agents to reach a final status. Completed statuses may include the agent final message.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        targets: { type: "array", description: "Agent ids to wait on.", items: { type: "string" } },
+        timeout_ms: { type: "number", description: "Timeout in milliseconds. Defaults to 30000, min 10000, max 3600000." },
+      },
+      required: ["targets"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "multi_agent_v1__send_input",
+    description: "Send a message to an existing agent. Use interrupt=true to redirect work immediately.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        interrupt: { type: "boolean", description: "True interrupts the current task and handles this message immediately." },
+        items: { type: "array", description: "Structured input items.", items: CODEX_ITEM_INPUT_SCHEMA },
+        message: { type: "string", description: "Plain-text message to send to the agent." },
+        target: { type: "string", description: "Agent id to message (from spawn_agent)." },
+      },
+      required: ["target"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "multi_agent_v1__close_agent",
+    description: "Close an agent and any open descendants when they are no longer needed.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        target: { type: "string", description: "Agent id to close (from spawn_agent)." },
+      },
+      required: ["target"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "multi_agent_v1__resume_agent",
+    description: "Resume a previously closed agent by id so it can receive send_input and wait_agent calls.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Agent id to resume." },
+      },
+      required: ["id"],
+      additionalProperties: false,
+    },
+  },
+]
+
 const TOOLS_CACHE_MAX = 32
 const normalizedToolsCache = new Map()
 
@@ -2369,6 +2462,18 @@ function normalizeTools(body) {
     })
   }
   if (selected && !tools.length) throw new UnsupportedContent(`tool_choice names undeclared tool ${selected}`)
+  if (
+    !selected &&
+    seen.has("tool_search") &&
+    (seen.has("exec_command") || seen.has("apply_patch"))
+  ) {
+    for (const extra of CODEX_PREDECLARED_MULTI_AGENT_TOOLS) {
+      if (!seen.has(extra.name)) {
+        seen.add(extra.name)
+        tools.push(extra)
+      }
+    }
+  }
   if (cacheKey !== null) {
     if (normalizedToolsCache.size >= TOOLS_CACHE_MAX) {
       normalizedToolsCache.delete(normalizedToolsCache.keys().next().value)
@@ -3903,7 +4008,7 @@ export const AntigravityBridgePlugin = async () => {
                         }
                       }
                       proc.instructions = instructions
-                      await proc.updateTools(tools)
+                      await proc.updateTools(tools, false)
                       proc.continueWith(results)
                       proc.recordToolResults(turn, body.messages)
                     }
