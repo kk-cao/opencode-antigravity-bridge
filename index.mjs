@@ -15,8 +15,8 @@ const SESSION_HEADER = "x-magpie-session"
 const MCP_SERVER_PATH = fileURLToPath(new URL("./mcp-server.mjs", import.meta.url))
 // agy exposes tools from the --ide-mcp-port server as direct functions with this prefix.
 const IDE_TOOL_PREFIX = "mcp_ide-tools_"
-const IDLE_MS = positiveTimeout(process.env.AGY_BRIDGE_IDLE_MS, 30 * 60 * 1000)
-const MAX_IDLE_PROCS = positiveTimeout(process.env.AGY_BRIDGE_MAX_IDLE_PROCS, 8)
+const IDLE_MS = positiveTimeout(process.env.AGY_BRIDGE_IDLE_MS, 10 * 60 * 1000)
+const MAX_IDLE_PROCS = positiveTimeout(process.env.AGY_BRIDGE_MAX_IDLE_PROCS, 4)
 const MAX_PROCS = positiveTimeout(process.env.AGY_BRIDGE_MAX_PROCS, 16)
 const MAX_PARKED = 64
 const DEFAULT_PROC_START_TIMEOUT_MS = 60_000
@@ -1807,7 +1807,7 @@ function takeParked(convKey, opts) {
   return { sessionId: entry.sessionId, expectedMessages: opts.history }
 }
 
-const WARM_STANDBY_MAX = 4
+const WARM_STANDBY_MAX = 1
 const warmStandbyProcs = []
 const warmStandbyPromises = new Set()
 let warmStandbyTimer = null
@@ -1846,9 +1846,7 @@ function scheduleWarmStandby(agyPath, delayMs = 200) {
       return
     }
     while (warmStandbyProcs.length + warmStandbyPromises.size < WARM_STANDBY_MAX) {
-      if (allProcs.size >= MAX_IDLE_PROCS) {
-        if (!(await evictLRU())) break
-      }
+      if (allProcs.size >= MAX_IDLE_PROCS) break
       const proc = new Proc(agyPath, "__standby__", {})
       const p = proc.start(true).then(() => {
         if (!proc.dead && !proc.retiring && warmStandbyProcs.length < WARM_STANDBY_MAX) {
@@ -1915,8 +1913,14 @@ async function evictIdle() {
     proc.stop().catch(() => {})
   }
   pruneWarmStandby()
-  if (warmStandbyProcs.length < WARM_STANDBY_MAX && cachedAgyPath) {
-    scheduleWarmStandby(cachedAgyPath)
+  for (let i = warmStandbyProcs.length - 1; i >= 0; i--) {
+    const proc = warmStandbyProcs[i]
+    if (!proc.turn && proc.lastUsed < cutoff) {
+      warmStandbyProcs.splice(i, 1)
+      proc.retiring = true
+      allProcs.delete(proc)
+      proc.stop().catch(() => {})
+    }
   }
 }
 
