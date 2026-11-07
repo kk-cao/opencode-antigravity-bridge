@@ -1836,14 +1836,18 @@ function scheduleWarmStandby(agyPath, delayMs = 200) {
     warmStandbyTimer = null
     if (!warmStandbyEnabled()) return
     pruneWarmStandby()
+    const activeTurns = [...allProcs].filter((proc) => proc.turn && !proc.dead && !proc.retiring).length
     if (
       process.env.AGY_BRIDGE_WARM_STANDBY !== "1" &&
-      [...allProcs].some((proc) => proc.turn && !proc.dead && !proc.retiring)
+      activeTurns >= 2
     ) {
       scheduleWarmStandby(agyPath, 4000)
       return
     }
-    while (warmStandbyProcs.length + warmStandbyPromises.size < WARM_STANDBY_MAX) {
+    const batchLimit = process.env.AGY_BRIDGE_WARM_STANDBY !== "1" && activeTurns === 1
+      ? Math.min(WARM_STANDBY_MAX, warmStandbyProcs.length + 1)
+      : WARM_STANDBY_MAX
+    while (warmStandbyProcs.length + warmStandbyPromises.size < batchLimit) {
       if (allProcs.size >= MAX_IDLE_PROCS) {
         if (!(await evictLRU())) break
       }
@@ -1851,6 +1855,7 @@ function scheduleWarmStandby(agyPath, delayMs = 200) {
       const p = proc.start(true).then(() => {
         if (!proc.dead && !proc.retiring && warmStandbyProcs.length < WARM_STANDBY_MAX) {
           warmStandbyProcs.push(proc)
+          if (warmStandbyProcs.length < WARM_STANDBY_MAX) scheduleWarmStandby(agyPath, 1500)
         } else {
           proc.stop().catch(() => {})
         }
@@ -3445,6 +3450,9 @@ function readStepTranscriptUsage(proc) {
       const entry = JSON.parse(lines[i])
       if (entry?.type !== "PLANNER_RESPONSE") continue
       if (typeof entry.step_index === "number" && entry.step_index <= (proc.lastTranscriptStepIndex ?? -1)) {
+        if (entry.step_index === proc.lastTranscriptStepIndex && proc.lastTranscriptUsage) {
+          return { ...proc.lastTranscriptUsage, isNewStep: false }
+        }
         return null
       }
       const input = Number(entry.input_tokens)
@@ -3454,12 +3462,14 @@ function readStepTranscriptUsage(proc) {
       if (typeof entry.step_index === "number") {
         proc.lastTranscriptStepIndex = entry.step_index
       }
-      return {
+      const usage = {
         input_tokens: Math.max(0, Math.round(input || 0)),
         output_tokens: Math.max(1, Math.round(output || 0)),
         cache_read_input_tokens: Math.max(0, Math.round(cacheRead || 0)),
         cache_creation_input_tokens: 0,
       }
+      proc.lastTranscriptUsage = usage
+      return { ...usage, isNewStep: true }
     } catch {}
   }
   return null
@@ -3601,6 +3611,9 @@ function makeAnthropicStream(proc, turn, body, msgId, signal) {
             turn.toolSteps = (turn.toolSteps || 0) + 1
             emitToolUse(event.call)
             // Calls agy issued together leave in the same response.
+            if (!turn.events.length && !turn.done && !turn.cancelRequested) {
+              await new Promise((resolve) => setTimeout(resolve, 15))
+            }
             while (turn.events[0]?.type === "tool") emitToolUse(turn.events.shift().call)
             const stepText = responseContent.map((block) =>
               block.type === "text" ? block.text
@@ -3614,12 +3627,15 @@ function makeAnthropicStream(proc, turn, body, msgId, signal) {
             const stepThinkingTokens = stepThinkingText ? Math.max(1, estimateTextTokens(stepThinkingText)) : 0
             const stepOutputTokens = Math.max(1, estimateTextTokens(stepText))
             const transcriptUsage = readStepTranscriptUsage(proc)
-            const reportedOut = transcriptUsage ? transcriptUsage.output_tokens : stepOutputTokens
+            const isNewStep = transcriptUsage?.isNewStep !== false
+            const reportedOut = transcriptUsage
+              ? (isNewStep ? transcriptUsage.output_tokens : 0)
+              : stepOutputTokens
             turn.reportedOutputTokens = (turn.reportedOutputTokens || 0) + reportedOut
             const toolStepUsage = transcriptUsage
               ? {
                 input_tokens: transcriptUsage.input_tokens,
-                output_tokens: transcriptUsage.output_tokens + stepThinkingTokens,
+                output_tokens: (isNewStep ? transcriptUsage.output_tokens : stepOutputTokens) + stepThinkingTokens,
                 cache_read_input_tokens: transcriptUsage.cache_read_input_tokens,
                 ...(stepThinkingTokens > 0 ? { output_tokens_details: { thinking_tokens: stepThinkingTokens } } : {}),
               }
@@ -3638,7 +3654,8 @@ function makeAnthropicStream(proc, turn, body, msgId, signal) {
           if (event.type === "result") {
             const steps = (turn.toolSteps || 0) + 1
             const baseUsage = translateUsage(event.result.usage, steps, turn.reportedOutputTokens || 0) || emptyUsage
-            const transcriptUsage = steps > 1 ? readStepTranscriptUsage(proc) : null
+            const rawTranscriptUsage = steps > 1 ? readStepTranscriptUsage(proc) : null
+            const transcriptUsage = rawTranscriptUsage?.isNewStep ? rawTranscriptUsage : null
             const thinking = baseUsage.output_tokens_details?.thinking_tokens || 0
             const usage = transcriptUsage
               ? {
@@ -3991,13 +4008,15 @@ export const AntigravityBridgePlugin = async () => {
                   if (!interrupted) proc.validateResults(results)
                   const directIdsMatch = matches.every((item) => item.match?.call?.id === item.block.tool_use_id)
                   const historyMatches = directIdsMatch
-                    ? proc.matchesPendingTurnHistory(turn, trailingMessages(body).history)
-                    : proc.matchesHistory(trailingMessages(body).history)
+                    ? proc.matchesPendingTurnHistory(turn, trailing.history)
+                    : proc.matchesHistory(trailing.history)
                   const declaredTools = new Set((proc.tools || []).map((item) => item.name))
                   const unlockedByToolSearch = tools.some((item) => !declaredTools.has(item.name)) &&
                     rawResults.some((item) => /^(?:tool_search|ToolSearch)$/i.test(item.call?.name || ""))
+                  const instructionsChanged = proc.instructions !== instructions &&
+                    instructionsKey(proc.instructions) !== instructionsKey(instructions)
                   if (interrupted || !historyMatches || unlockedByToolSearch ||
-                    proc.workDir !== workDir || instructionsKey(proc.instructions) !== instructionsKey(instructions)) {
+                    proc.workDir !== workDir || instructionsChanged) {
                     // A changed context, deferred tools newly unlocked by tool_search,
                     // or user-interrupted tool turn needs a new session so agy rebuilds its
                     // executor with the updated tool declarations. Replay the real results

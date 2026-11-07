@@ -12,8 +12,8 @@ const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "agy-compat-test-"))
 const entry = new URL("./index.mjs", import.meta.url)
 let source = fs.readFileSync(entry, "utf8")
 source = source.replace(/from "(\.\/[^"\n]+)"/g, (_, target) => `from ${JSON.stringify(new URL(target, entry).href)}`)
-fs.writeFileSync(path.join(workspace, "bridge.mjs"), source + "\nexport { inspectToolTurn, canReplayFollowUpAfterResults, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, withStateLock, Turn, translateUsage, conversationKey, instructionsKey, extractDynamicSystemBlocks, MAGPIE_PLACEHOLDER_NOTICE, normalizeTools, toolResult, blockText };\n")
-const { inspectToolTurn, canReplayFollowUpAfterResults, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, withStateLock, Turn, translateUsage, conversationKey, instructionsKey, extractDynamicSystemBlocks, MAGPIE_PLACEHOLDER_NOTICE, normalizeTools, toolResult, blockText, AntigravityBridgePlugin } = await import(pathToFileURL(path.join(workspace, "bridge.mjs")).href)
+fs.writeFileSync(path.join(workspace, "bridge.mjs"), source + "\nexport { inspectToolTurn, canReplayFollowUpAfterResults, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, withStateLock, Turn, translateUsage, conversationKey, instructionsKey, extractDynamicSystemBlocks, MAGPIE_PLACEHOLDER_NOTICE, normalizeTools, toolResult, blockText, readStepTranscriptUsage, bridgeGeminiDir };\n")
+const { inspectToolTurn, canReplayFollowUpAfterResults, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, withStateLock, Turn, translateUsage, conversationKey, instructionsKey, extractDynamicSystemBlocks, MAGPIE_PLACEHOLDER_NOTICE, normalizeTools, toolResult, blockText, readStepTranscriptUsage, bridgeGeminiDir, AntigravityBridgePlugin } = await import(pathToFileURL(path.join(workspace, "bridge.mjs")).href)
 after(() => fs.rmSync(workspace, { recursive: true, force: true }))
 
 const image = { type: "image", source: { type: "base64", media_type: "image/png", data: "aW1hZ2VB" } }
@@ -273,4 +273,36 @@ test("normalizeTools predeclares Codex multi_agent_v1 tools when tool_search and
   assert.ok(names.includes("multi_agent_v1__send_input"))
   assert.ok(names.includes("multi_agent_v1__close_agent"))
   assert.ok(names.includes("multi_agent_v1__resume_agent"))
+})
+
+test("readStepTranscriptUsage preserves cache_read_input_tokens across sub-steps of the same PLANNER_RESPONSE", () => {
+  const sessionId = "test-session-" + Date.now()
+  const logDir = path.join(bridgeGeminiDir(), "antigravity-cli", "brain", sessionId, ".system_generated", "logs")
+  fs.mkdirSync(logDir, { recursive: true })
+  const transcriptPath = path.join(logDir, "transcript.jsonl")
+  try {
+    fs.writeFileSync(transcriptPath, [
+      JSON.stringify({ step_index: 0, type: "USER_INPUT" }),
+      JSON.stringify({ step_index: 1, type: "PLANNER_RESPONSE", input_tokens: 2307, cache_read_tokens: 38707, output_tokens: 1647 }),
+    ].join("\n") + "\n")
+    const proc = { sessionId }
+    const first = readStepTranscriptUsage(proc)
+    assert.deepEqual(first, {
+      input_tokens: 2307,
+      output_tokens: 1647,
+      cache_read_input_tokens: 38707,
+      cache_creation_input_tokens: 0,
+      isNewStep: true,
+    })
+    const secondSameStep = readStepTranscriptUsage(proc)
+    assert.deepEqual(secondSameStep, {
+      input_tokens: 2307,
+      output_tokens: 1647,
+      cache_read_input_tokens: 38707,
+      cache_creation_input_tokens: 0,
+      isNewStep: false,
+    })
+  } finally {
+    fs.rmSync(path.join(bridgeGeminiDir(), "antigravity-cli", "brain", sessionId), { recursive: true, force: true })
+  }
 })
