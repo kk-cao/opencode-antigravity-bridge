@@ -12,8 +12,8 @@ const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "agy-compat-test-"))
 const entry = new URL("./index.mjs", import.meta.url)
 let source = fs.readFileSync(entry, "utf8")
 source = source.replace(/from "(\.\/[^"\n]+)"/g, (_, target) => `from ${JSON.stringify(new URL(target, entry).href)}`)
-fs.writeFileSync(path.join(workspace, "bridge.mjs"), source + "\nexport { inspectToolTurn, canReplayFollowUpAfterResults, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, withStateLock, Turn, translateUsage, conversationKey, instructionsKey, extractDynamicSystemBlocks, MAGPIE_PLACEHOLDER_NOTICE, normalizeTools, toolResult, blockText, readStepTranscriptUsage, bridgeGeminiDir, compactSkillsInstructions, sessionInstructions };\n")
-const { inspectToolTurn, canReplayFollowUpAfterResults, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, withStateLock, Turn, translateUsage, conversationKey, instructionsKey, extractDynamicSystemBlocks, MAGPIE_PLACEHOLDER_NOTICE, normalizeTools, toolResult, blockText, readStepTranscriptUsage, bridgeGeminiDir, compactSkillsInstructions, sessionInstructions, AntigravityBridgePlugin } = await import(pathToFileURL(path.join(workspace, "bridge.mjs")).href)
+fs.writeFileSync(path.join(workspace, "bridge.mjs"), source + "\nexport { inspectToolTurn, canReplayFollowUpAfterResults, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, withStateLock, Turn, translateUsage, conversationKey, instructionsKey, extractDynamicSystemBlocks, MAGPIE_PLACEHOLDER_NOTICE, normalizeTools, toolResult, blockText, readStepTranscriptUsage, bridgeGeminiDir, compactSkillsInstructions, sessionInstructions, normalizeApplyPatchArgs };\n")
+const { inspectToolTurn, canReplayFollowUpAfterResults, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, withStateLock, Turn, translateUsage, conversationKey, instructionsKey, extractDynamicSystemBlocks, MAGPIE_PLACEHOLDER_NOTICE, normalizeTools, toolResult, blockText, readStepTranscriptUsage, bridgeGeminiDir, compactSkillsInstructions, sessionInstructions, normalizeApplyPatchArgs, AntigravityBridgePlugin } = await import(pathToFileURL(path.join(workspace, "bridge.mjs")).href)
 after(() => fs.rmSync(workspace, { recursive: true, force: true }))
 
 const image = { type: "image", source: { type: "base64", media_type: "image/png", data: "aW1hZ2VB" } }
@@ -334,4 +334,26 @@ test("compactSkillsInstructions keeps local skill roots verbatim and compacts re
   const msgText = msgOut.map((p) => p.text || "").join("\n")
   assert.ok(msgText.includes("- vercel:nextjs: Next.js App Router principles. (file: r4/nextjs/SKILL.md)"))
   assert.ok(!msgText.includes("Triggers on next.config.js"))
+})
+
+test("normalizeApplyPatchArgs merges multi-envelope Begin/End Patch blocks into a single valid patch", () => {
+  const rawPatch = [
+    "*** Begin Patch",
+    "*** Update File: C:\\Users\\Chris\\Desktop\\temp\\rate-limit.js",
+    "@@",
+    "-const a = 1;",
+    "+const a = 2;",
+    "*** End Patch",
+    "*** Begin Patch",
+    "*** Update File: C:\\Users\\Chris\\Desktop\\temp\\rate-limit.test.js",
+    "@@",
+    "-assert.equal(a, 1);",
+    "+assert.equal(a, 2);",
+    "*** End Patch",
+  ].join("\n")
+
+  const out = normalizeApplyPatchArgs("apply_patch", { input: rawPatch })
+  assert.deepEqual(out.input.match(/\*\*\* (?:Begin|End) Patch/g), ["*** Begin Patch", "*** End Patch"])
+  assert.ok(out.input.includes("*** Update File: C:\\Users\\Chris\\Desktop\\temp\\rate-limit.js"))
+  assert.ok(out.input.includes("*** Update File: C:\\Users\\Chris\\Desktop\\temp\\rate-limit.test.js"))
 })

@@ -1238,8 +1238,9 @@ class Proc {
       throw new Error("agy bridge: no active turn for MCP call")
     }
     const name = message.name
-    const args = message.arguments ?? {}
-    if (!args || typeof args !== "object" || Array.isArray(args)) throw new Error("agy bridge: invalid tool arguments")
+    const rawArgs = message.arguments ?? {}
+    if (!rawArgs || typeof rawArgs !== "object" || Array.isArray(rawArgs)) throw new Error("agy bridge: invalid tool arguments")
+    const args = normalizeApplyPatchArgs(name, rawArgs)
     if (!this.tools.some((tool) => tool.name === name)) throw new Error(`agy bridge: undeclared tool ${name}`)
     const signature = stableJSON(args)
     const deferredCalls = turn.calls.filter((call) => call.deferred && !call.lateDelivered)
@@ -2537,6 +2538,27 @@ function compactMiddleText(text, maxChars, label = "historical tool output") {
   return `${str.slice(0, half)}\n...[${label} compacted (${omitted} chars omitted to preserve recent conversation context)]...\n${str.slice(str.length - half)}`
 }
 
+function normalizeApplyPatchText(patch) {
+  if (typeof patch !== "string" || !patch.includes("*** Begin Patch")) return patch
+  return patch.replace(
+    /\r?\n(?:(?:\*\*\* End Patch\r?\n\s*)+(?:\*\*\* Begin Patch\r?\n\s*)*|(?:\*\*\* Begin Patch\r?\n\s*)+)(?=\*\*\* (?:Update|Add|Delete) File:)/g,
+    "\n",
+  )
+}
+
+function normalizeApplyPatchArgs(name, args) {
+  if (name !== "apply_patch" || !args || typeof args !== "object") return args
+  if (typeof args.input === "string") {
+    const next = normalizeApplyPatchText(args.input)
+    return next === args.input ? args : { ...args, input: next }
+  }
+  if (typeof args.patch === "string") {
+    const next = normalizeApplyPatchText(args.patch)
+    return next === args.patch ? args : { ...args, patch: next }
+  }
+  return args
+}
+
 function prefixToolSearchText(text) {
   if (typeof text !== "string" || !text.includes("These tools are now available to call:")) return text
   return text.replace(
@@ -3633,9 +3655,6 @@ function makeAnthropicStream(proc, turn, body, msgId, signal) {
             turn.toolSteps = (turn.toolSteps || 0) + 1
             emitToolUse(event.call)
             // Calls agy issued together leave in the same response.
-            if (!turn.events.length && !turn.done && !turn.cancelRequested) {
-              await new Promise((resolve) => setTimeout(resolve, 15))
-            }
             while (turn.events[0]?.type === "tool") emitToolUse(turn.events.shift().call)
             const stepText = responseContent.map((block) =>
               block.type === "text" ? block.text
