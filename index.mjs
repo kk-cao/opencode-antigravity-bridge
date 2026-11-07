@@ -1839,15 +1839,12 @@ function scheduleWarmStandby(agyPath, delayMs = 200) {
     const activeTurns = [...allProcs].filter((proc) => proc.turn && !proc.dead && !proc.retiring).length
     if (
       process.env.AGY_BRIDGE_WARM_STANDBY !== "1" &&
-      activeTurns >= 2
+      activeTurns > 0
     ) {
       scheduleWarmStandby(agyPath, 4000)
       return
     }
-    const batchLimit = process.env.AGY_BRIDGE_WARM_STANDBY !== "1" && activeTurns === 1
-      ? Math.min(WARM_STANDBY_MAX, warmStandbyProcs.length + 1)
-      : WARM_STANDBY_MAX
-    while (warmStandbyProcs.length + warmStandbyPromises.size < batchLimit) {
+    while (warmStandbyProcs.length + warmStandbyPromises.size < WARM_STANDBY_MAX) {
       if (allProcs.size >= MAX_IDLE_PROCS) {
         if (!(await evictLRU())) break
       }
