@@ -2217,9 +2217,34 @@ function matchToolResults(body, blocks) {
   return found || direct
 }
 
+function compactSkillsInstructions(text) {
+  if (typeof text !== "string" || !text.includes("<skills_instructions>")) return text
+  return text.replace(/<skills_instructions>[\s\S]*?<\/skills_instructions>/g, (section) => {
+    const remoteRoots = new Set()
+    for (const rm of section.matchAll(/^-\s*`(r\d+)`\s*[:=]\s*`([^`]+)`/gm)) {
+      const [, id, rootPath] = rm
+      if (/\/plugins\/cache\//i.test(rootPath)) {
+        remoteRoots.add(id)
+      }
+    }
+    if (!remoteRoots.size) return section
+    return section.replace(/^(- [^\s:]+(?::[^\s:]+)?:\s+)(.+?)(\s+\(file:\s+(r\d+)\/[^\n)]+\))$/gm, (line, prefix, desc, suffix, rootId) => {
+      if (!remoteRoots.has(rootId)) return line
+      const sentenceMatch = desc.match(/^(.+?\.)(?:\s+(?:Use\b|Trigger|Do\s+not\b|Covers\b|Always\b|When\b|This\s+skill\b|[A-Z"\x60]))/)
+      let shortDesc = sentenceMatch ? sentenceMatch[1] : desc
+      if (shortDesc.length > 140) {
+        const cut = shortDesc.slice(0, 137).replace(/\s+\S*$/, "").replace(/[,;:]$/, "")
+        shortDesc = (cut || shortDesc.slice(0, 137)) + "..."
+      }
+      return `${prefix}${shortDesc}${suffix}`
+    })
+  })
+}
+
 function systemText(body) {
   if (!body.system) return ""
-  return typeof body.system === "string" ? body.system : body.system.map((block) => block.text || "").join("")
+  const raw = typeof body.system === "string" ? body.system : body.system.map((block) => block.text || "").join("")
+  return compactSkillsInstructions(raw)
 }
 
 // The model is not part of the key: agy switches models inside a live session.
@@ -2746,7 +2771,7 @@ function extractQueuedPrompt(raw) {
 function renderTurnMessage(message, opts = {}) {
   if (message.role === "user") {
     if (typeof message.content === "string") {
-      const raw = opts.stripHistoricalAlma ? stripHistoricalAlmaContext(message.content) : message.content
+      const raw = compactSkillsInstructions(opts.stripHistoricalAlma ? stripHistoricalAlmaContext(message.content) : message.content)
       const queued = extractQueuedPrompt(raw)
       return queued !== null ? queued : raw
     }
@@ -2761,7 +2786,7 @@ function renderTurnMessage(message, opts = {}) {
           continue
         }
         const rawBlock = blockText(block, opts)
-        const raw = opts.stripHistoricalAlma ? stripHistoricalAlmaContext(rawBlock) : rawBlock
+        const raw = compactSkillsInstructions(opts.stripHistoricalAlma ? stripHistoricalAlmaContext(rawBlock) : rawBlock)
         const queued = block?.type === "text" ? extractQueuedPrompt(raw) : null
         const rendered = queued !== null ? queued : raw
         if (rendered && afterBlock && !rendered.startsWith("\n") && !out.at(-1)?.endsWith("\n")) {
@@ -2780,7 +2805,7 @@ function renderTurnMessage(message, opts = {}) {
   const reminders = []
   const queuedParts = []
   for (const block of blocks) {
-    const raw = blockText(block, opts)
+    const raw = compactSkillsInstructions(blockText(block, opts))
     const trimmed = raw.trim()
     if (!trimmed) continue
     const queued = extractQueuedPrompt(trimmed)
@@ -2830,7 +2855,7 @@ function renderTurnMessageParts(message, opts = {}) {
       afterBlock = true
     } else {
       const rawBlock = blockText(block, opts)
-      const raw = opts.stripHistoricalAlma ? stripHistoricalAlmaContext(rawBlock) : rawBlock
+      const raw = compactSkillsInstructions(opts.stripHistoricalAlma ? stripHistoricalAlmaContext(rawBlock) : rawBlock)
       const queued = block?.type === "text" ? extractQueuedPrompt(raw) : null
       const rendered = queued !== null ? queued : raw
       const needsSep = rendered && afterBlock && !rendered.startsWith("\n") &&
@@ -3755,7 +3780,7 @@ function estimateInputTokens(body) {
       }
     }
   }
-  walk(body.system)
+  walk(systemText(body))
   walk(body.messages)
   if (Array.isArray(body.tools) && body.tools.length) {
     total += estimateTextTokens(JSON.stringify(body.tools))

@@ -12,8 +12,8 @@ const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "agy-compat-test-"))
 const entry = new URL("./index.mjs", import.meta.url)
 let source = fs.readFileSync(entry, "utf8")
 source = source.replace(/from "(\.\/[^"\n]+)"/g, (_, target) => `from ${JSON.stringify(new URL(target, entry).href)}`)
-fs.writeFileSync(path.join(workspace, "bridge.mjs"), source + "\nexport { inspectToolTurn, canReplayFollowUpAfterResults, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, withStateLock, Turn, translateUsage, conversationKey, instructionsKey, extractDynamicSystemBlocks, MAGPIE_PLACEHOLDER_NOTICE, normalizeTools, toolResult, blockText, readStepTranscriptUsage, bridgeGeminiDir };\n")
-const { inspectToolTurn, canReplayFollowUpAfterResults, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, withStateLock, Turn, translateUsage, conversationKey, instructionsKey, extractDynamicSystemBlocks, MAGPIE_PLACEHOLDER_NOTICE, normalizeTools, toolResult, blockText, readStepTranscriptUsage, bridgeGeminiDir, AntigravityBridgePlugin } = await import(pathToFileURL(path.join(workspace, "bridge.mjs")).href)
+fs.writeFileSync(path.join(workspace, "bridge.mjs"), source + "\nexport { inspectToolTurn, canReplayFollowUpAfterResults, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, withStateLock, Turn, translateUsage, conversationKey, instructionsKey, extractDynamicSystemBlocks, MAGPIE_PLACEHOLDER_NOTICE, normalizeTools, toolResult, blockText, readStepTranscriptUsage, bridgeGeminiDir, compactSkillsInstructions, sessionInstructions };\n")
+const { inspectToolTurn, canReplayFollowUpAfterResults, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, withStateLock, Turn, translateUsage, conversationKey, instructionsKey, extractDynamicSystemBlocks, MAGPIE_PLACEHOLDER_NOTICE, normalizeTools, toolResult, blockText, readStepTranscriptUsage, bridgeGeminiDir, compactSkillsInstructions, sessionInstructions, AntigravityBridgePlugin } = await import(pathToFileURL(path.join(workspace, "bridge.mjs")).href)
 after(() => fs.rmSync(workspace, { recursive: true, force: true }))
 
 const image = { type: "image", source: { type: "base64", media_type: "image/png", data: "aW1hZ2VB" } }
@@ -305,4 +305,33 @@ test("readStepTranscriptUsage preserves cache_read_input_tokens across sub-steps
   } finally {
     fs.rmSync(path.join(bridgeGeminiDir(), "antigravity-cli", "brain", sessionId), { recursive: true, force: true })
   }
+})
+
+test("compactSkillsInstructions keeps local skill roots verbatim and compacts remote plugin cache descriptions", () => {
+  const sampleBlock = [
+    "<skills_instructions>",
+    "### Skill roots",
+    "- `r0` = `C:/Users/Chris/.codex/skills`",
+    "- `r1` = `C:/Users/Chris/.agents/skills`",
+    "- `r4` = `C:/Users/Chris/.codex/plugins/cache/openai-curated-remote/vercel/0.54.1/skills`",
+    "### Available skills",
+    "- local-skill: Detailed local skill description that should remain completely untouched. Use when doing local work and never truncate this second sentence. (file: r0/local-skill/SKILL.md)",
+    "- vercel:nextjs: Next.js App Router principles. Server Components, data fetching, rendering strategies, caching, and Vercel deployment optimizations. Use this skill whenever the user mentions Next.js, App Router, Server Actions, or React Server Components. Triggers on next.config.js, page.tsx, layout.tsx. (file: r4/nextjs/SKILL.md)",
+    "</skills_instructions>",
+  ].join("\n")
+
+  const compacted = compactSkillsInstructions(sampleBlock)
+  assert.ok(compacted.includes("- local-skill: Detailed local skill description that should remain completely untouched. Use when doing local work and never truncate this second sentence. (file: r0/local-skill/SKILL.md)"))
+  assert.ok(compacted.includes("- vercel:nextjs: Next.js App Router principles. (file: r4/nextjs/SKILL.md)"))
+  assert.ok(!compacted.includes("Triggers on next.config.js"))
+
+  const sysOut = sessionInstructions({ system: sampleBlock }, "C:/Users/Chris/Desktop/temp")
+  assert.ok(sysOut.includes("- vercel:nextjs: Next.js App Router principles. (file: r4/nextjs/SKILL.md)"))
+
+  const msgOut = renderInitialPromptParts({
+    messages: [{ role: "user", content: sampleBlock }],
+  }, "C:/Users/Chris/Desktop/temp", true)
+  const msgText = msgOut.map((p) => p.text || "").join("\n")
+  assert.ok(msgText.includes("- vercel:nextjs: Next.js App Router principles. (file: r4/nextjs/SKILL.md)"))
+  assert.ok(!msgText.includes("Triggers on next.config.js"))
 })
