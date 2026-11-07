@@ -356,4 +356,14 @@ test("normalizeApplyPatchArgs merges multi-envelope Begin/End Patch blocks into 
   assert.deepEqual(out.input.match(/\*\*\* (?:Begin|End) Patch/g), ["*** Begin Patch", "*** End Patch"])
   assert.ok(out.input.includes("*** Update File: C:\\Users\\Chris\\Desktop\\temp\\rate-limit.js"))
   assert.ok(out.input.includes("*** Update File: C:\\Users\\Chris\\Desktop\\temp\\rate-limit.test.js"))
+
+  const normalized = normalizeTools({
+    tools: [{
+      name: "apply_patch",
+      description: "The `apply_patch` tool can be used to edit files. This is a FREEFORM tool, so do not wrap the patch in JSON.",
+      input_schema: { type: "object", properties: { input: { type: "string" } } },
+    }],
+  })
+  assert.ok(normalized[0].description.includes("start: begin_patch hunk+ end_patch"))
+  assert.ok(!normalized[0].description.includes("do not wrap the patch in JSON"))
 })

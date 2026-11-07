@@ -2496,9 +2496,29 @@ function normalizeTools(body) {
       throw new UnsupportedContent(`an invalid schema for tool ${tool.name}`)
     }
     const inputSchema = sanitizeInputSchema(rawSchema)
+    let description = typeof tool.description === "string" ? tool.description : ""
+    if (tool.name === "apply_patch" && !description.includes("begin_patch hunk+ end_patch")) {
+      description = [
+        "Edit files using a single patch string passed in the `input` property.",
+        "The patch string MUST strictly follow this grammar (note `start: begin_patch hunk+ end_patch` — when patching multiple files in one call, put all `*** Add/Delete/Update File:` hunks inside ONE outer `*** Begin Patch` ... `*** End Patch` envelope; never emit multiple `*** Begin Patch` or `*** End Patch` lines):",
+        "start: begin_patch hunk+ end_patch",
+        "begin_patch: \"*** Begin Patch\" LF",
+        "end_patch: \"*** End Patch\" LF?",
+        "hunk: add_hunk | delete_hunk | update_hunk",
+        "add_hunk: \"*** Add File: \" filename LF add_line+",
+        "delete_hunk: \"*** Delete File: \" filename LF",
+        "update_hunk: \"*** Update File: \" filename LF change_move? change?",
+        "add_line: \"+\" /(.*)/ LF",
+        "change_move: \"*** Move to: \" filename LF",
+        "change: (change_context | change_line)+ eof_line?",
+        "change_context: (\"@@\" | \"@@ \" /(.+)/) LF",
+        "change_line: (\"+\" | \"-\" | \" \") /(.*)/ LF",
+        "eof_line: \"*** End of File\" LF",
+      ].join("\n")
+    }
     tools.push({
       name: tool.name,
-      description: typeof tool.description === "string" ? tool.description : "",
+      description,
       inputSchema,
     })
   }
